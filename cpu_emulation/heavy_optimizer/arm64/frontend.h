@@ -166,7 +166,7 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] Register Copy(Register value) {
     Register result = AllocTempReg();
     if (success()) {
-      builder_.Gen<Copy>(result, value, kMeta<&x86_64::kGeneralReg64>);
+      builder_.Gen<berberis::Copy>(result, value, kMeta<&x86_64::kGeneralReg64>);
     }
     return result;
   }
@@ -647,7 +647,7 @@ class HeavyOptimizerFrontend {
           } else if (kSSAMode == kSSA) {
             output[output_index] = AllocTempReg();
             if (InsnType::kInfo.reg_kinds[index].IsInput()) {
-              builder_.Gen<Copy>(
+              builder_.Gen<berberis::Copy>(
                   output[output_index],
                   input[input_index++],
                   x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
@@ -662,7 +662,7 @@ class HeavyOptimizerFrontend {
         if (kSSAMode == kSSA && InsnType::kInfo.reg_kinds[index].RegClass()->num_regs == 1) {
           CHECK(InsnType::kInfo.reg_kinds[index].RegClass() != &x86_64::kFLAGS);
           gen_args[index] = AllocTempReg();
-          builder_.Gen<Copy>(
+          builder_.Gen<berberis::Copy>(
               gen_args[index],
               input[input_index++],
               x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
@@ -693,6 +693,21 @@ class HeavyOptimizerFrontend {
       Gen,
       (, kSSAMode))
 
+  // Emits an instruction straight through the builder, with none of the SSA
+  // copy insertion Gen() above does: these callers already hold the registers
+  // they pass. Android 16 wrote builder_.Gen<Insn> for this, which AOSP 17 will
+  // not accept for an instruction that has a kUseDef operand unless the SSA
+  // mode is named -- and the adapter names it, as kForceNoSSA, which is the
+  // Android 16 layout.
+  BERBERIS_DECLARE_ARM64_MACHINE_INSN_ADAPTER(
+      /*may_discard*/ auto GenRaw,
+      (),
+      MachineInsn,
+      ConstructorArgsTuple,
+      BERBERIS_ARM64_INSN_PTR,
+      builder_.Gen,
+      ())
+
   // Materialize ARM64 NZCV into ThreadState.cpu.flags from the host EFLAGS that
   // a preceding x86 ALU op left in `flags_vreg`. Bit-exact with
   // lite_translator.h::EmitStoreArmNZCV:
@@ -705,15 +720,14 @@ class HeavyOptimizerFrontend {
   // touches a neighbouring field.
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
-    builder_.Gen<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
+    GenRaw<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
     raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
       raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
     }
-    builder_.Gen<x86_64::MovwOpReg>(
-        {.base = x86_64::kMachineRegRBP,
-         .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
-        raw);
+    GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP,
+                               .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
+                              raw);
   }
 
   // ARM64 TBI (Top Byte Ignore): clear the top 8 bits of an address register
@@ -790,9 +804,9 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] FpRegister EmitWidenHalfToF32(uint8_t reg) {
     FpRegister raw = GetVRegScalar(reg, /*is_double=*/false);  // MOVSD: [half,junk,0,0]
     FpRegister mask = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdXRegReg>(mask.machine_reg(), GetImm(uint64_t{0x0000FFFF}));
-    builder_.Gen<x86_64::PandXRegXReg>(raw.machine_reg(), mask.machine_reg());  // [half,0,0,0]
-    builder_.Gen<x86_64::Vcvtph2psXRegXReg>(raw.machine_reg(), raw.machine_reg());  // [f32,+0,+0,+0]
+    GenRaw<x86_64::MovdXRegReg>(mask.machine_reg(), GetImm(uint64_t{0x0000FFFF}));
+    GenRaw<x86_64::PandXRegXReg>(raw.machine_reg(), mask.machine_reg());      // [half,0,0,0]
+    GenRaw<x86_64::Vcvtph2psXRegXReg>(raw.machine_reg(), raw.machine_reg());  // [f32,+0,+0,+0]
     return raw;
   }
 
@@ -801,8 +815,7 @@ class HeavyOptimizerFrontend {
   // single rounding; +0.0 upper lanes narrow to 0x0000 so bits[31:16] of lane 0
   // are zero when SetVRegScalar copies it. Caller must have checked F16C.
   void EmitNarrowF32ToHalfAndStore(uint8_t reg, FpRegister val) {
-    builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(val.machine_reg(), val.machine_reg(),
-                                               int8_t{0});
+    GenRaw<x86_64::Vcvtps2phXRegXRegImm>(val.machine_reg(), val.machine_reg(), int8_t{0});
     SetVRegScalar(reg, val, /*is_double=*/false);
   }
 
@@ -824,14 +837,14 @@ class HeavyOptimizerFrontend {
     builder_.GenGetSimd<16>(xlo.machine_reg(), voff);
     if (q) {
       FpRegister xhi = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xlo.machine_reg());
-      builder_.Gen<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::Vcvtph2psXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xlo.machine_reg());
+      GenRaw<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
+      GenRaw<x86_64::Vcvtph2psXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
       *hi = xhi;
     }
     // VCVTPH2PS reads only the low 64 bits (4 halves) of its source; lanes 4..7 in the
     // 128-bit load are ignored, so no pre-mask is needed for the low group.
-    builder_.Gen<x86_64::Vcvtph2psXRegXReg>(xlo.machine_reg(), xlo.machine_reg());
+    GenRaw<x86_64::Vcvtph2psXRegXReg>(xlo.machine_reg(), xlo.machine_reg());
     *lo = xlo;
   }
 
@@ -842,11 +855,11 @@ class HeavyOptimizerFrontend {
   // high group is shifted into the upper 64 (PSLLDQ 8) and OR'd in. SetVRegFull zeroes
   // Vd[127:64] for q=0. Caller must have checked host_platform::kHasF16C.
   void EmitNarrowHalfVecAndStore(uint8_t rd, FpRegister lo, FpRegister hi, bool q) {
-    builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(lo.machine_reg(), lo.machine_reg(), int8_t{0});
+    GenRaw<x86_64::Vcvtps2phXRegXRegImm>(lo.machine_reg(), lo.machine_reg(), int8_t{0});
     if (q) {
-      builder_.Gen<x86_64::Vcvtps2phXRegXRegImm>(hi.machine_reg(), hi.machine_reg(), int8_t{0});
-      builder_.Gen<x86_64::PslldqXRegImm>(hi.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PorXRegXReg>(lo.machine_reg(), hi.machine_reg());
+      GenRaw<x86_64::Vcvtps2phXRegXRegImm>(hi.machine_reg(), hi.machine_reg(), int8_t{0});
+      GenRaw<x86_64::PslldqXRegImm>(hi.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PorXRegXReg>(lo.machine_reg(), hi.machine_reg());
     }
     SetVRegFull(rd, lo, q);
   }
@@ -858,7 +871,7 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] FpRegister AllocZeroedSimdReg() {
     FpRegister zero = AllocTempSimdReg();
     builder_.Gen<PseudoDefReg>(zero.machine_reg(), kMeta<&x86_64::kXmmReg>);
-    builder_.Gen<x86_64::PxorXRegXReg>(zero.machine_reg(), zero.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(zero.machine_reg(), zero.machine_reg());
     return zero;
   }
 
@@ -870,7 +883,7 @@ class HeavyOptimizerFrontend {
   // size); PCMPEQD is used as the single canonical form.
   [[nodiscard]] FpRegister AllocOnesSimdReg() {
     FpRegister ones = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
     return ones;
   }
 
@@ -1029,7 +1042,7 @@ class HeavyOptimizerFrontend {
     auto* cont_bb = builder_.ir()->NewBasicBlock();
     builder_.ir()->AddEdge(region_entry_bb, cont_bb);
     builder_.StartBasicBlock(region_entry_bb);
-    builder_.Gen<Branch>(cont_bb);
+    builder_.Gen<berberis::Branch>(cont_bb);
     builder_.StartBasicBlock(cont_bb);
   }
 

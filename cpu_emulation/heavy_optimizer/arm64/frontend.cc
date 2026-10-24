@@ -246,7 +246,7 @@ void HeavyOptimizerFrontend::GenRecoveryBlockForLastInsn() {
   // Note, even though there are two bb successors, we only explicitly branch to
   // the continue_bb, since jump to the recovery_bb is set up by the signal
   // handler.
-  builder_.Gen<Branch>(continue_bb);
+  builder_.Gen<berberis::Branch>(continue_bb);
 
   builder_.StartBasicBlock(recovery_bb);
   ExitGeneratedCode(GetInsnAddr());
@@ -701,10 +701,9 @@ void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
   if (tail.is_sub) {
     raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
   }
-  builder_.Gen<x86_64::MovwOpReg>(
-      {.base = x86_64::kMachineRegRBP,
-       .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
-      raw);
+  GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP,
+                             .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
+                            raw);
 }
 
 // An in-region jump to a fused B.cond arrives without the setter's host flags
@@ -742,8 +741,7 @@ void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
     }
     auto* entry_bb = ir->NewBasicBlock();
     builder_.StartBasicBlock(entry_bb);
-    builder_.Gen<x86_64::MovwRegOp>(fused.tail.raw,
-                                    {.base = x86_64::kMachineRegRBP, .disp = flags_disp});
+    GenRaw<x86_64::MovwRegOp>(fused.tail.raw, {.base = x86_64::kMachineRegRBP, .disp = flags_disp});
     if (fused.tail.is_sub) {
       Gen<x86_64::XorlRegImm, kNoSSA>(fused.tail.raw, static_cast<int32_t>(CPUState::kFlagCarry));
     }
@@ -895,11 +893,11 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   }
 
   Register result = AllocTempReg();
-  builder_.Gen<Copy>(result, false_val, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, false_val, kMeta<&x86_64::kGeneralReg64>);
 
   // AL/NV: always select src1 (unconditional). No branch needed.
   if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
-    builder_.Gen<Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
     return result;
   }
 
@@ -916,9 +914,9 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   EmitCondBranch(cond, then_bb, merge_bb);
 
   builder_.StartBasicBlock(then_bb);
-  builder_.Gen<Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(then_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -939,7 +937,7 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   // Divide-by-zero path writes 0; the divide path overwrites result with the
   // quotient. Both edges define `result`, so it holds the right value at merge.
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-  builder_.Gen<Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
 
   auto* ir = builder_.ir();
   auto* cur_bb = builder_.bb();
@@ -962,9 +960,9 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   } else {
     quotient = std::get<0>(Gen<x86_64::DivlRegRegReg>(src1, hi, src2));
   }
-  builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -982,7 +980,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
 
   Register result = AllocTempReg();
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-  builder_.Gen<Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
 
   auto* ir = builder_.ir();
   auto* cur_bb = builder_.bb();
@@ -1016,9 +1014,9 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   } else {
     neg = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(negbase, src1));
   }
-  builder_.Gen<Copy>(result, neg, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, neg, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(neg_one_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   // Real division: RDX = sign-extension of the dividend (CQO/CDQ equivalent).
   builder_.StartBasicBlock(div_bb);
@@ -1031,9 +1029,9 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
         std::get<0>(Gen<x86_64::MovlRegReg>(src1)), int8_t{31}));
     quotient = std::get<0>(Gen<x86_64::IdivlRegRegReg>(src1, hi, src2));
   }
-  builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   return result;
@@ -1071,7 +1069,7 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
       flags_val |= CPUState::kFlagOverflow;
     }
     Register imm_reg = GetImm(flags_val);
-    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm_reg);
+    GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm_reg);
   };
 
   // The compare path: CMP is non-destructive (CmpqRegReg only defs FLAGS); CMN
@@ -1116,12 +1114,12 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
   builder_.StartBasicBlock(cmp_bb);
   emit_compare_path();
   ir->AddEdge(cmp_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(imm_bb);
   emit_immediate_path();
   ir->AddEdge(imm_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
 }
@@ -1144,7 +1142,7 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
 
   Register raw = AllocTempReg();
-  builder_.Gen<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
+  GenRaw<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
 
   auto* ir = builder_.ir();
   MachineBasicBlock* uo_bb = ir->NewBasicBlock();       // unordered (PF)
@@ -1159,9 +1157,9 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   auto store_leaf = [&](uint16_t nzcv_word, MachineBasicBlock* bb) {
     builder_.StartBasicBlock(bb);
     Register imm = GetImm(nzcv_word);
-    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
+    GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
     ir->AddEdge(bb, merge_bb);
-    builder_.Gen<Branch>(merge_bb);
+    builder_.Gen<berberis::Branch>(merge_bb);
   };
 
   // PF (bit 10) set -> unordered, else fall to the ZF test.
@@ -1266,7 +1264,7 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
       flags_val |= CPUState::kFlagOverflow;
     }
     Register imm = GetImm(flags_val);
-    builder_.Gen<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
+    GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}, imm);
   };
 
   auto emit_compare_path = [&]() {
@@ -1304,12 +1302,12 @@ void HeavyOptimizerFrontend::FpConditionalCompare(
   // emit_compare_path built an NZCV sub-tree; connect its tail to merge.
   MachineBasicBlock* cmp_tail = builder_.bb();
   ir->AddEdge(cmp_tail, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(imm_bb);
   emit_immediate_path();
   ir->AddEdge(imm_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
 }
@@ -1343,12 +1341,12 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
       FpRegister xscale = AllocTempSimdReg();
       if (is_double) {
         const uint64_t scale_bits = static_cast<uint64_t>(1023u - fbits) << 52;
-        builder_.Gen<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
-        builder_.Gen<x86_64::MulsdXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
+        GenRaw<x86_64::MulsdXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
       } else {
         const uint32_t scale_bits = static_cast<uint32_t>(127u - fbits) << 23;
-        builder_.Gen<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
-        builder_.Gen<x86_64::MulssXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
+        GenRaw<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
+        GenRaw<x86_64::MulssXRegXReg>(xmm.machine_reg(), xscale.machine_reg());
       }
     }
     SetVRegScalar(args.rd, xmm, is_double);
@@ -1377,15 +1375,15 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     FpRegister xmm = AllocTempSimdReg();
     if (args.sf) {
       if (is_double) {
-        builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), src);
+        GenRaw<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), src);
       } else {
-        builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), src);
+        GenRaw<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), src);
       }
     } else {
       if (is_double) {
-        builder_.Gen<x86_64::Cvtsi2sdlXRegReg>(xmm.machine_reg(), src);
+        GenRaw<x86_64::Cvtsi2sdlXRegReg>(xmm.machine_reg(), src);
       } else {
-        builder_.Gen<x86_64::Cvtsi2sslXRegReg>(xmm.machine_reg(), src);
+        GenRaw<x86_64::Cvtsi2sslXRegReg>(xmm.machine_reg(), src);
       }
     }
     finish(xmm);
@@ -1397,9 +1395,9 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     Register zx = std::get<0>(Gen<x86_64::MovlRegReg>(src));
     FpRegister xmm = AllocTempSimdReg();
     if (is_double) {
-      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), zx);
+      GenRaw<x86_64::Cvtsi2sdqXRegReg>(xmm.machine_reg(), zx);
     } else {
-      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), zx);
+      GenRaw<x86_64::Cvtsi2ssqXRegReg>(xmm.machine_reg(), zx);
     }
     finish(xmm);
     return;
@@ -1426,14 +1424,14 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
   {
     FpRegister xd = AllocTempSimdReg();
     if (is_double) {
-      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xd.machine_reg(), src);
+      GenRaw<x86_64::Cvtsi2sdqXRegReg>(xd.machine_reg(), src);
     } else {
-      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xd.machine_reg(), src);
+      GenRaw<x86_64::Cvtsi2ssqXRegReg>(xd.machine_reg(), src);
     }
-    builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xd.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(result.machine_reg(), xd.machine_reg());
   }
   ir->AddEdge(direct_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   // Fix-up: value >= 2^63. odd = (src >> 1) | (src & 1); convert; double.
   builder_.StartBasicBlock(fixup_bb);
@@ -1443,16 +1441,16 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
     Register odd = std::get<0>(Gen<x86_64::OrqRegReg>(halved, low_bit));
     FpRegister xf = AllocTempSimdReg();
     if (is_double) {
-      builder_.Gen<x86_64::Cvtsi2sdqXRegReg>(xf.machine_reg(), odd);
-      builder_.Gen<x86_64::AddsdXRegXReg>(xf.machine_reg(), xf.machine_reg());
+      GenRaw<x86_64::Cvtsi2sdqXRegReg>(xf.machine_reg(), odd);
+      GenRaw<x86_64::AddsdXRegXReg>(xf.machine_reg(), xf.machine_reg());
     } else {
-      builder_.Gen<x86_64::Cvtsi2ssqXRegReg>(xf.machine_reg(), odd);
-      builder_.Gen<x86_64::AddssXRegXReg>(xf.machine_reg(), xf.machine_reg());
+      GenRaw<x86_64::Cvtsi2ssqXRegReg>(xf.machine_reg(), odd);
+      GenRaw<x86_64::AddssXRegXReg>(xf.machine_reg(), xf.machine_reg());
     }
-    builder_.Gen<x86_64::MovdqaXRegXReg>(result.machine_reg(), xf.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(result.machine_reg(), xf.machine_reg());
   }
   ir->AddEdge(fixup_bb, merge_bb);
-  builder_.Gen<Branch>(merge_bb);
+  builder_.Gen<berberis::Branch>(merge_bb);
 
   builder_.StartBasicBlock(merge_bb);
   finish(result);
@@ -1497,16 +1495,16 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   // first and independently.
   if (fbits != 0) {
     FpRegister scaled = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(scaled.machine_reg(), xmm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(scaled.machine_reg(), xmm.machine_reg());
     FpRegister xscale = AllocTempSimdReg();
     if (is_double) {
       const uint64_t scale_bits = static_cast<uint64_t>(1023u + fbits) << 52;
-      builder_.Gen<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
-      builder_.Gen<x86_64::MulsdXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(xscale.machine_reg(), GetImm(scale_bits));
+      GenRaw<x86_64::MulsdXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
     } else {
       const uint32_t scale_bits = static_cast<uint32_t>(127u + fbits) << 23;
-      builder_.Gen<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
-      builder_.Gen<x86_64::MulssXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(xscale.machine_reg(), GetImm(uint64_t{scale_bits}));
+      GenRaw<x86_64::MulssXRegXReg>(scaled.machine_reg(), xscale.machine_reg());
     }
     xmm = scaled;
   }
@@ -1526,39 +1524,39 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     FpRegister half = AllocTempSimdReg();
     FpRegister thresh = AllocTempSimdReg();
     FpRegister rounded = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
     if (is_double) {
       // addend = copysign(0.5d, x) = (x & sign_bit) | bits(0.5d).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xmm.machine_reg());
-      builder_.Gen<x86_64::MovqXRegReg>(half.machine_reg(),
-                                        GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
-      builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), xmm.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(half.machine_reg(),
+                                  GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
+      GenRaw<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
       // gate = (|x| < 2^52) ? all-ones : 0, via thresh > |x|.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
-      builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xmm.machine_reg());
-      builder_.Gen<x86_64::MovqXRegReg>(thresh.machine_reg(),
-                                        GetImm(uint64_t{0x4330000000000000}));  // 2^52
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
-      builder_.Gen<x86_64::AddpdXRegXReg>(rounded.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
+      GenRaw<x86_64::PandXRegXReg>(absx.machine_reg(), xmm.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(thresh.machine_reg(),
+                                  GetImm(uint64_t{0x4330000000000000}));  // 2^52
+      GenRaw<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+      GenRaw<x86_64::AddpdXRegXReg>(rounded.machine_reg(), sign.machine_reg());
     } else {
       // addend = copysign(0.5f, x) = (x & sign_bit) | bits(0.5f).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xmm.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
-      builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), xmm.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+      GenRaw<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
       // |x| = x & 0x7FFFFFFF; gate the addend to 0 where |x| >= 2^23.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
-      builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xmm.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
-      builder_.Gen<x86_64::AddpsXRegXReg>(rounded.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+      GenRaw<x86_64::PandXRegXReg>(absx.machine_reg(), xmm.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+      GenRaw<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+      GenRaw<x86_64::AddpsXRegXReg>(rounded.machine_reg(), sign.machine_reg());
     }
     xmm = rounded;
   }
@@ -1572,13 +1570,11 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   // FP64 uses scalar ROUNDSD.
   if (round_imm >= 0) {
     FpRegister rounded = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(rounded.machine_reg(), xmm.machine_reg());
     if (is_double) {
-      builder_.Gen<x86_64::RoundsdXRegXRegImm>(
-          rounded.machine_reg(), rounded.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundsdXRegXRegImm>(rounded.machine_reg(), rounded.machine_reg(), round_imm);
     } else {
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(
-          rounded.machine_reg(), rounded.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundpsXRegXRegImm>(rounded.machine_reg(), rounded.machine_reg(), round_imm);
     }
     xmm = rounded;
   }
@@ -1607,9 +1603,9 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
   auto fp_const = [&](uint64_t bits) -> FpRegister {
     FpRegister c = AllocTempSimdReg();
     if (is_double) {
-      builder_.Gen<x86_64::MovqXRegReg>(c.machine_reg(), GetImm(bits));
+      GenRaw<x86_64::MovqXRegReg>(c.machine_reg(), GetImm(bits));
     } else {
-      builder_.Gen<x86_64::MovdXRegReg>(c.machine_reg(), GetImm(bits & 0xFFFFFFFF));
+      GenRaw<x86_64::MovdXRegReg>(c.machine_reg(), GetImm(bits & 0xFFFFFFFF));
     }
     return c;
   };
@@ -1626,7 +1622,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
       tmp = is_double ? std::get<0>(Gen<x86_64::Cvttsd2silRegXReg>(xmm.machine_reg()))
                       : std::get<0>(Gen<x86_64::Cvttss2silRegXReg>(xmm.machine_reg()));
     }
-    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default: keep tmp
+    builder_.Gen<berberis::Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default: keep tmp
 
     auto* cur_bb = builder_.bb();
     MachineBasicBlock* nan_bb = ir->NewBasicBlock();
@@ -1641,9 +1637,9 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
         x86_64::Assembler::Condition::kParityEven, nan_bb, notnan_bb, ucomi_self());
 
     builder_.StartBasicBlock(nan_bb);
-    builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     // Non-NaN: FP < 0 keeps tmp (in-range neg or INT_MIN indefinite); FP >= 0
     // falls to the positive-overflow test.
@@ -1665,9 +1661,9 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
 
     builder_.StartBasicBlock(ovf_bb);
     const uint64_t int_max = args.sf ? static_cast<uint64_t>(INT64_MAX) : uint64_t{0x7FFFFFFF};
-    builder_.Gen<Copy>(result, GetImm(int_max), kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(result, GetImm(int_max), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     builder_.StartBasicBlock(done_bb);
     commit(result);
@@ -1699,7 +1695,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
 
     builder_.StartBasicBlock(pos_bb);
     Register tmp = cvtt_q(xmm);
-    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default in-range
+    builder_.Gen<berberis::Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default in-range
     Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(tmp), int8_t{32}));
     Register hi_flags = std::get<0>(Gen<x86_64::TestqRegReg>(hi, hi));
     ir->AddEdge(pos_bb, done_bb);
@@ -1707,9 +1703,10 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kZero, done_bb, ovf_bb, hi_flags);
 
     builder_.StartBasicBlock(ovf_bb);
-    builder_.Gen<Copy>(result, GetImm(uint64_t{0xFFFFFFFF}), kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(
+        result, GetImm(uint64_t{0xFFFFFFFF}), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
   } else {
     // sf=1 (uint64): cvtt-Q covers [0, 2^63) directly. FP >= 2^63 uses the
     // offset trick (subtract 2^63, cvtt, set bit 63); FP >= 2^64 saturates.
@@ -1741,9 +1738,9 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.Gen<CondBranch>(x86_64::Assembler::Condition::kBelow, direct_bb, ge63_bb, lt_flags);
 
     builder_.StartBasicBlock(direct_bb);
-    builder_.Gen<Copy>(result, cvtt_q(xmm), kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(result, cvtt_q(xmm), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(direct_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     // FP >= 2^63: FP >= 2^64 (or +Inf) saturates; else the offset trick.
     builder_.StartBasicBlock(ge63_bb);
@@ -1759,32 +1756,33 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
         x86_64::Assembler::Condition::kAboveEqual, satmax_bb, inrange_bb, ge_flags);
 
     builder_.StartBasicBlock(satmax_bb);
-    builder_.Gen<Copy>(result, GetImm(~uint64_t{0}), kMeta<&x86_64::kGeneralReg64>);  // UINT64_MAX
+    builder_.Gen<berberis::Copy>(
+        result, GetImm(~uint64_t{0}), kMeta<&x86_64::kGeneralReg64>);  // UINT64_MAX
     ir->AddEdge(satmax_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     // FP in [2^63, 2^64): subtract 2^63 (exact), cvtt to int64, set bit 63.
     // Subss/Subsd is use_def; copy the source into a temp first.
     builder_.StartBasicBlock(inrange_bb);
     FpRegister bound63b = fp_const(bits_2p63);
     FpRegister xsub = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xsub.machine_reg(), xmm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xsub.machine_reg(), xmm.machine_reg());
     if (is_double) {
-      builder_.Gen<x86_64::SubsdXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
+      GenRaw<x86_64::SubsdXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
     } else {
-      builder_.Gen<x86_64::SubssXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
+      GenRaw<x86_64::SubssXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
     }
     Register tmp = cvtt_q(xsub);
     tmp = std::get<0>(Gen<x86_64::BtsqRegImm, kNoSSA>(tmp, int8_t{63}));
-    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(inrange_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
   }
 
   builder_.StartBasicBlock(zero_bb);
-  builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
+  builder_.Gen<berberis::Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(zero_bb, done_bb);
-  builder_.Gen<Branch>(done_bb);
+  builder_.Gen<berberis::Branch>(done_bb);
 
   builder_.StartBasicBlock(done_bb);
   commit(result);
@@ -1844,7 +1842,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         return;
       }
       Store(lss, base, 0, data);
-      builder_.Gen<x86_64::Mfence>();
+      GenRaw<x86_64::Mfence>();
       return;
     }
 
@@ -1855,12 +1853,10 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         return;
       }
       // reservation_address = base.
-      builder_.Gen<x86_64::MovqOpReg>(
-          {.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
+      GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
       // reservation_value = res (low 64 bits of the 128-bit slot, as the lite
       // tier does; the single-register forms only ever use 64 bits).
-      builder_.Gen<x86_64::MovqOpReg>(
-          {.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, res);
+      GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, res);
       if (args.rt != 31) {
         SetReg(args.rt, res);
       }
@@ -1944,15 +1940,15 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       // --- success: status = 0 (XOR self, with a PseudoDef to seat the value). ---
       builder_.StartBasicBlock(swap_ok_bb);
       builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
-      builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
+      GenRaw<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
       ir->AddEdge(swap_ok_bb, merge_bb);
-      builder_.Gen<Branch>(merge_bb);
+      builder_.Gen<berberis::Branch>(merge_bb);
 
       // --- failure (addr mismatch or CMPXCHG miss): status = 1. ---
       builder_.StartBasicBlock(fail_bb);
-      builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
+      GenRaw<x86_64::MovqRegImm>(status, int64_t{1});
       ir->AddEdge(fail_bb, merge_bb);
-      builder_.Gen<Branch>(merge_bb);
+      builder_.Gen<berberis::Branch>(merge_bb);
 
       builder_.StartBasicBlock(merge_bb);
       if (args.rs != 31) {
@@ -2130,7 +2126,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       MachineBasicBlock* loop_bb = ir->NewBasicBlock();
       MachineBasicBlock* exit_bb = ir->NewBasicBlock();
       ir->AddEdge(builder_.bb(), loop_bb);
-      builder_.Gen<Branch>(loop_bb);
+      builder_.Gen<berberis::Branch>(loop_bb);
 
       builder_.StartBasicBlock(loop_bb);
       // Relaxed, zero-extended load of the current memory value (the CMPXCHG
@@ -2240,7 +2236,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       MachineBasicBlock* cmpxchg_bb = ir->NewBasicBlock();
       MachineBasicBlock* exit_bb = ir->NewBasicBlock();
       ir->AddEdge(builder_.bb(), loop_bb);
-      builder_.Gen<Branch>(loop_bb);
+      builder_.Gen<berberis::Branch>(loop_bb);
 
       builder_.StartBasicBlock(loop_bb);
       Register old;
@@ -2305,14 +2301,14 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       builder_.Gen<CondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
 
       builder_.StartBasicBlock(pick_old_bb);
-      builder_.Gen<Copy>(new_val, old, kMeta<&x86_64::kGeneralReg64>);
+      builder_.Gen<berberis::Copy>(new_val, old, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_old_bb, cmpxchg_bb);
-      builder_.Gen<Branch>(cmpxchg_bb);
+      builder_.Gen<berberis::Branch>(cmpxchg_bb);
 
       builder_.StartBasicBlock(pick_op_bb);
-      builder_.Gen<Copy>(new_val, operand, kMeta<&x86_64::kGeneralReg64>);
+      builder_.Gen<berberis::Copy>(new_val, operand, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_op_bb, cmpxchg_bb);
-      builder_.Gen<Branch>(cmpxchg_bb);
+      builder_.Gen<berberis::Branch>(cmpxchg_bb);
 
       builder_.StartBasicBlock(cmpxchg_bb);
       Register expected = Copy(old);
@@ -2427,10 +2423,8 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         Register pair = std::get<0>(Gen<x86_64::MovqRegOp>({.base = base}));
         GenRecoveryBlockForLastInsn();
         // reservation_address = base; reservation_value = the 64-bit pair.
-        builder_.Gen<x86_64::MovqOpReg>(
-            {.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
-        builder_.Gen<x86_64::MovqOpReg>(
-            {.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, pair);
+        GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
+        GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, pair);
         if (args.rt != 31) {
           // Rt = low 32, zero-extended (Movl clears the upper 32).
           SetReg(args.rt, std::get<0>(Gen<x86_64::MovlRegReg>(pair)));
@@ -2456,12 +2450,10 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
         Register old_lo = res[0];  // RAX
         Register old_hi = res[1];  // RDX
         // reservation_address = base; reservation_value = full 128-bit pair.
-        builder_.Gen<x86_64::MovqOpReg>(
-            {.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
-        builder_.Gen<x86_64::MovqOpReg>(
-            {.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, old_lo);
-        builder_.Gen<x86_64::MovqOpReg>(
-            {.base = x86_64::kMachineRegRBP, .disp = resv_val_off + 8}, old_hi);
+        GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}, base);
+        GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off}, old_lo);
+        GenRaw<x86_64::MovqOpReg>({.base = x86_64::kMachineRegRBP, .disp = resv_val_off + 8},
+                                  old_hi);
         if (args.rt != 31) {
           SetReg(args.rt, old_lo);
         }
@@ -2527,14 +2519,14 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
 
         builder_.StartBasicBlock(swap_ok_bb);
         builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
-        builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
+        GenRaw<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
         ir->AddEdge(swap_ok_bb, merge_bb);
-        builder_.Gen<Branch>(merge_bb);
+        builder_.Gen<berberis::Branch>(merge_bb);
 
         builder_.StartBasicBlock(fail_bb);
-        builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
+        GenRaw<x86_64::MovqRegImm>(status, int64_t{1});
         ir->AddEdge(fail_bb, merge_bb);
-        builder_.Gen<Branch>(merge_bb);
+        builder_.Gen<berberis::Branch>(merge_bb);
 
         builder_.StartBasicBlock(merge_bb);
         if (args.rs != 31) {
@@ -2583,14 +2575,14 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
 
         builder_.StartBasicBlock(swap_ok_bb);
         builder_.Gen<PseudoDefReg>(status, kMeta<&x86_64::kGeneralReg64>);
-        builder_.Gen<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
+        GenRaw<x86_64::XorqRegReg>(status, status, GetFlagsRegister());
         ir->AddEdge(swap_ok_bb, merge_bb);
-        builder_.Gen<Branch>(merge_bb);
+        builder_.Gen<berberis::Branch>(merge_bb);
 
         builder_.StartBasicBlock(fail_bb);
-        builder_.Gen<x86_64::MovqRegImm>(status, int64_t{1});
+        GenRaw<x86_64::MovqRegImm>(status, int64_t{1});
         ir->AddEdge(fail_bb, merge_bb);
-        builder_.Gen<Branch>(merge_bb);
+        builder_.Gen<berberis::Branch>(merge_bb);
 
         builder_.StartBasicBlock(merge_bb);
         if (args.rs != 31) {
@@ -2612,7 +2604,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
 
 void HeavyOptimizerFrontend::DataMemoryBarrier() {
   // Full DMB/DSB -> MFENCE: recover the StoreLoad ordering x86 TSO omits.
-  builder_.Gen<x86_64::Mfence>();
+  GenRaw<x86_64::Mfence>();
 }
 
 void HeavyOptimizerFrontend::RecordBail(BailReason reason) {
@@ -3832,13 +3824,13 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
         Register tlo = std::get<0>(Gen<x86_64::MovlRegReg>(t));
         Register thi = std::get<0>(Gen<x86_64::ShrqRegImm>(t, int8_t{32}));
         FpRegister xh = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdXRegReg>(xt.machine_reg(), tlo);
-        builder_.Gen<x86_64::MovdXRegReg>(xh.machine_reg(), thi);
-        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x163CD6124}));
-        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
-        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710640}));
-        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xh.machine_reg(), xk.machine_reg(), int8_t{0x00});
-        builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xh.machine_reg());
+        GenRaw<x86_64::MovdXRegReg>(xt.machine_reg(), tlo);
+        GenRaw<x86_64::MovdXRegReg>(xh.machine_reg(), thi);
+        GenRaw<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x163CD6124}));
+        GenRaw<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710640}));
+        GenRaw<x86_64::PclmulqdqXRegXRegImm>(xh.machine_reg(), xk.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::PxorXRegXReg>(xt.machine_reg(), xh.machine_reg());
       } else {
         Register masked = std::get<0>(Gen<x86_64::MovlRegReg>(src2));  // zext Wm
         uint64_t kc;
@@ -3853,9 +3845,9 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
             kc = 0x1DB710640; break;
         }
         Register t = std::get<0>(Gen<x86_64::XorqRegReg>(acc, masked));  // T
-        builder_.Gen<x86_64::MovdXRegReg>(xt.machine_reg(), t);
-        builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(kc));
-        builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::MovdXRegReg>(xt.machine_reg(), t);
+        GenRaw<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(kc));
+        GenRaw<x86_64::PclmulqdqXRegXRegImm>(xt.machine_reg(), xk.machine_reg(), int8_t{0x00});
       }
       // Reflected Barrett reduction of the 64-bit fold value (xt.q0) -> 32-bit.
       // 32-bit MOVD round-trips realize the R&M32 / t1&M32 masks. A fresh xb
@@ -3863,13 +3855,13 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
       FpRegister xb = AllocTempSimdReg();
       Register r = std::get<0>(Gen<x86_64::MovqRegXReg>(xt.machine_reg()));  // R=proc
       Register rlo = std::get<0>(Gen<x86_64::MovlRegReg>(r));                // R&M32
-      builder_.Gen<x86_64::MovdXRegReg>(xb.machine_reg(), rlo);
-      builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1F7011641}));  // MU
-      builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdXRegReg>(xb.machine_reg(), rlo);
+      GenRaw<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1F7011641}));  // MU
+      GenRaw<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
       Register t1 = std::get<0>(Gen<x86_64::MovdRegXReg>(xb.machine_reg()));  // t1&M32
-      builder_.Gen<x86_64::MovdXRegReg>(xb.machine_reg(), t1);
-      builder_.Gen<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710641}));  // POLYR
-      builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdXRegReg>(xb.machine_reg(), t1);
+      GenRaw<x86_64::MovqXRegReg>(xk.machine_reg(), GetImm(uint64_t{0x1DB710641}));  // POLYR
+      GenRaw<x86_64::PclmulqdqXRegXRegImm>(xb.machine_reg(), xk.machine_reg(), int8_t{0x00});
       Register t2 = std::get<0>(Gen<x86_64::MovqRegXReg>(xb.machine_reg()));  // t2 (64-bit)
       Register xored = std::get<0>(Gen<x86_64::XorqRegReg>(r, t2));
       Register crc = std::get<0>(Gen<x86_64::ShrqRegImm>(xored, int8_t{32}));
@@ -4314,7 +4306,7 @@ void HeavyOptimizerFrontend::FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, ui
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
   Register mask_gp = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, pred));
   FpRegister mask = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), mask_gp);
+  GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), mask_gp);
 
   // Blend into a private temp: res = (Vn & mask) | (Vm & ~mask), PANDN(d,s) =
   // ~d & s. `vn`/`vm` are the guest-context GET results (a MOVSD of V[rn]/V[rm]
@@ -4329,10 +4321,10 @@ void HeavyOptimizerFrontend::FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, ui
   // mirrors the FRINT/FCVT "round into a private temp so the guest v[] slot is
   // untouched" idiom, and is correct regardless of the forwarding optimizer.
   FpRegister res = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(res.machine_reg(), vn.machine_reg());
-  builder_.Gen<x86_64::PandXRegXReg>(res.machine_reg(), mask.machine_reg());
-  builder_.Gen<x86_64::PandnXRegXReg>(mask.machine_reg(), vm.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(res.machine_reg(), mask.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(res.machine_reg(), vn.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(res.machine_reg(), mask.machine_reg());
+  GenRaw<x86_64::PandnXRegXReg>(mask.machine_reg(), vm.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(res.machine_reg(), mask.machine_reg());
 
   SetVRegScalar(rd, res, is_double);
 }
@@ -4427,11 +4419,11 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
   FpRegister xmm_n, xmm_m, xmm_a;
   if (is_half) {
     xmm_n = EmitWidenHalfToF32(rn);
-    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_n.machine_reg(), xmm_n.machine_reg());
+    GenRaw<x86_64::Cvtps2pdXRegXReg>(xmm_n.machine_reg(), xmm_n.machine_reg());
     xmm_m = EmitWidenHalfToF32(rm);
-    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_m.machine_reg(), xmm_m.machine_reg());
+    GenRaw<x86_64::Cvtps2pdXRegXReg>(xmm_m.machine_reg(), xmm_m.machine_reg());
     xmm_a = EmitWidenHalfToF32(ra);
-    builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xmm_a.machine_reg(), xmm_a.machine_reg());
+    GenRaw<x86_64::Cvtps2pdXRegXReg>(xmm_a.machine_reg(), xmm_a.machine_reg());
   } else {
     xmm_n = GetVRegScalar(rn, is_double);
     xmm_m = GetVRegScalar(rm, is_double);
@@ -4440,43 +4432,43 @@ void HeavyOptimizerFrontend::FpDataProc3(uint8_t rd, uint8_t rn, uint8_t rm, uin
   // FP16 fuses in the SD (FP64) form, exactly as the lite tier does.
   const bool use_double_fma = is_double || is_half;
   FpRegister acc = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(acc.machine_reg(), xmm_a.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(acc.machine_reg(), xmm_a.machine_reg());
   if (!o1 && !o0) {  // FMADD
     if (use_double_fma) {
-      builder_.Gen<x86_64::Vfmadd231sdXRegXRegXReg>(
+      GenRaw<x86_64::Vfmadd231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
-      builder_.Gen<x86_64::Vfmadd231ssXRegXRegXReg>(
+      GenRaw<x86_64::Vfmadd231ssXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else if (!o1 && o0) {  // FMSUB
     if (use_double_fma) {
-      builder_.Gen<x86_64::Vfnmadd231sdXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmadd231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
-      builder_.Gen<x86_64::Vfnmadd231ssXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmadd231ssXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else if (o1 && !o0) {  // FNMADD
     if (use_double_fma) {
-      builder_.Gen<x86_64::Vfnmsub231sdXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmsub231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
-      builder_.Gen<x86_64::Vfnmsub231ssXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmsub231ssXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   } else {  // FNMSUB
     if (use_double_fma) {
-      builder_.Gen<x86_64::Vfmsub231sdXRegXRegXReg>(
+      GenRaw<x86_64::Vfmsub231sdXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     } else {
-      builder_.Gen<x86_64::Vfmsub231ssXRegXRegXReg>(
+      GenRaw<x86_64::Vfmsub231ssXRegXRegXReg>(
           acc.machine_reg(), xmm_n.machine_reg(), xmm_m.machine_reg());
     }
   }
   if (is_half) {
     // Narrow FP64 -> FP32 (lane 1 = +0.0 preserved by the SD FMA) -> fp16, store.
-    builder_.Gen<x86_64::Cvtpd2psXRegXReg>(acc.machine_reg(), acc.machine_reg());
+    GenRaw<x86_64::Cvtpd2psXRegXReg>(acc.machine_reg(), acc.machine_reg());
     EmitNarrowF32ToHalfAndStore(rd, acc);
     return;
   }
@@ -4545,7 +4537,7 @@ void HeavyOptimizerFrontend::FpIntConversion(const Decoder::FpIntConvArgs& args)
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
       Register src = (args.rn < 31) ? GetReg(args.rn)
                                     : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));  // XZR
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(xd.machine_reg(), src, int8_t{1});
+      GenRaw<x86_64::PinsrqXRegRegImm>(xd.machine_reg(), src, int8_t{1});
       builder_.GenSetSimd<16>(vd_off, xd.machine_reg());
     } else {
       // FMOV Xd, Vn.D[1]: read V[rn].D[1] into Xd (rd==31 discards).
@@ -4650,12 +4642,12 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
       FpRegister raw = GetVRegScalar(args.rn, /*is_double=*/false);
       FpRegister mask = AllocTempSimdReg();
       uint32_t keep = (args.opcode == 0b000001) ? 0x00007FFFu : 0x0000FFFFu;  // FABS clears sign
-      builder_.Gen<x86_64::MovdXRegReg>(mask.machine_reg(), GetImm(uint64_t{keep}));
-      builder_.Gen<x86_64::PandXRegXReg>(raw.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(mask.machine_reg(), GetImm(uint64_t{keep}));
+      GenRaw<x86_64::PandXRegXReg>(raw.machine_reg(), mask.machine_reg());
       if (args.opcode == 0b000010) {  // FNEG: flip sign bit 15
         FpRegister sb = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdXRegReg>(sb.machine_reg(), GetImm(uint64_t{0x00008000u}));
-        builder_.Gen<x86_64::PxorXRegXReg>(raw.machine_reg(), sb.machine_reg());
+        GenRaw<x86_64::MovdXRegReg>(sb.machine_reg(), GetImm(uint64_t{0x00008000u}));
+        GenRaw<x86_64::PxorXRegXReg>(raw.machine_reg(), sb.machine_reg());
       }
       SetVRegScalar(args.rd, raw, /*is_double=*/false);
       return;
@@ -4669,7 +4661,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
       FpRegister w = EmitWidenHalfToF32(args.rn);  // [f32(half),+0,+0,+0]
       if (args.opcode == 0b000101) {
         FpRegister d = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::Cvtss2sdXRegXReg>(d.machine_reg(), w.machine_reg());
+        GenRaw<x86_64::Cvtss2sdXRegXReg>(d.machine_reg(), w.machine_reg());
         SetVRegScalar(args.rd, d, /*is_double=*/true);
       } else {
         SetVRegScalar(args.rd, w, /*is_double=*/false);
@@ -4683,15 +4675,15 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
       // the lite half FRINTA (no gate).
       FpRegister w = EmitWidenHalfToF32(args.rn);   // [f32,+0,+0,+0]
       FpRegister signbit = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdXRegReg>(signbit.machine_reg(), GetImm(uint64_t{0x80000000u}));
+      GenRaw<x86_64::MovdXRegReg>(signbit.machine_reg(), GetImm(uint64_t{0x80000000u}));
       FpRegister addend = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(addend.machine_reg(), w.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), signbit.machine_reg());  // sign of x
+      GenRaw<x86_64::MovdqaXRegXReg>(addend.machine_reg(), w.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(addend.machine_reg(), signbit.machine_reg());  // sign of x
       FpRegister halfc = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdXRegReg>(halfc.machine_reg(), GetImm(uint64_t{0x3F000000u}));  // 0.5f
-      builder_.Gen<x86_64::PorXRegXReg>(addend.machine_reg(), halfc.machine_reg());  // copysign(0.5,x)
-      builder_.Gen<x86_64::AddssXRegXReg>(w.machine_reg(), addend.machine_reg());
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(w.machine_reg(), w.machine_reg(), int8_t{0x03});
+      GenRaw<x86_64::MovdXRegReg>(halfc.machine_reg(), GetImm(uint64_t{0x3F000000u}));  // 0.5f
+      GenRaw<x86_64::PorXRegXReg>(addend.machine_reg(), halfc.machine_reg());  // copysign(0.5,x)
+      GenRaw<x86_64::AddssXRegXReg>(w.machine_reg(), addend.machine_reg());
+      GenRaw<x86_64::RoundpsXRegXRegImm>(w.machine_reg(), w.machine_reg(), int8_t{0x03});
       EmitNarrowF32ToHalfAndStore(args.rd, w);
       return;
     }
@@ -4712,9 +4704,9 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     }
     FpRegister w = EmitWidenHalfToF32(args.rn);  // [f32,+0,+0,+0]
     if (is_sqrt) {
-      builder_.Gen<x86_64::SqrtssXRegXReg>(w.machine_reg(), w.machine_reg());  // scalar; upper +0.0
+      GenRaw<x86_64::SqrtssXRegXReg>(w.machine_reg(), w.machine_reg());  // scalar; upper +0.0
     } else {
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(w.machine_reg(), w.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundpsXRegXRegImm>(w.machine_reg(), w.machine_reg(), round_imm);
     }
     EmitNarrowF32ToHalfAndStore(args.rd, w);
     return;
@@ -4731,14 +4723,14 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
   if (!is_double && args.opcode == 0b000101) {  // FCVT Dd, Sn (single -> double)
     FpRegister src = GetVRegScalar(args.rn, /*is_double=*/false);
     FpRegister dst = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::Cvtss2sdXRegXReg>(dst.machine_reg(), src.machine_reg());
+    GenRaw<x86_64::Cvtss2sdXRegXReg>(dst.machine_reg(), src.machine_reg());
     SetVRegScalar(args.rd, dst, /*is_double=*/true);
     return;
   }
   if (is_double && args.opcode == 0b000100) {  // FCVT Sd, Dn (double -> single)
     FpRegister src = GetVRegScalar(args.rn, /*is_double=*/true);
     FpRegister dst = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::Cvtsd2ssXRegXReg>(dst.machine_reg(), src.machine_reg());
+    GenRaw<x86_64::Cvtsd2ssXRegXReg>(dst.machine_reg(), src.machine_reg());
     SetVRegScalar(args.rd, dst, /*is_double=*/false);
     return;
   }
@@ -4760,10 +4752,10 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
       // Cvtsd2ss result read directly by the in-place VCVTPS2PH does not
       // materialize under the local optimizer).
       FpRegister single = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::Cvtsd2ssXRegXReg>(single.machine_reg(), src.machine_reg());
-      builder_.Gen<x86_64::MovssXRegXReg>(s32.machine_reg(), single.machine_reg());
+      GenRaw<x86_64::Cvtsd2ssXRegXReg>(single.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MovssXRegXReg>(s32.machine_reg(), single.machine_reg());
     } else {
-      builder_.Gen<x86_64::MovssXRegXReg>(s32.machine_reg(), src.machine_reg());  // lane 0 only
+      GenRaw<x86_64::MovssXRegXReg>(s32.machine_reg(), src.machine_reg());  // lane 0 only
     }
     EmitNarrowF32ToHalfAndStore(args.rd, s32);
     return;
@@ -4817,23 +4809,23 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     Register r = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(Copy(bits), int32_t{0x7FFF}));
     r = std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(r, lsb));
     r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, int8_t{16}));
-    builder_.Gen<Copy>(out, r, kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(out, r, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(rtne_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     // NaN: out = (bits >> 16) | 0x0040 (force BF16 mantissa MSB -> quiet).
     builder_.StartBasicBlock(nan_bb);
     Register n = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(bits), int8_t{16}));
     n = std::get<0>(Gen<x86_64::OrlRegImm, kNoSSA>(n, int32_t{0x0040}));
-    builder_.Gen<Copy>(out, n, kMeta<&x86_64::kGeneralReg64>);
+    builder_.Gen<berberis::Copy>(out, n, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
-    builder_.Gen<Branch>(done_bb);
+    builder_.Gen<berberis::Branch>(done_bb);
 
     // Commit: BF16 in bits[15:0] of V[rd] (out's high 16 are already 0), rest
     // zeroed. MOVD zero-extends into lane 0; SetVRegScalar zeroes the upper bytes.
     builder_.StartBasicBlock(done_bb);
     FpRegister res = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdXRegReg>(res.machine_reg(), out);
+    GenRaw<x86_64::MovdXRegReg>(res.machine_reg(), out);
     SetVRegScalar(args.rd, res, /*is_double=*/false);
     return;
   }
@@ -4847,9 +4839,9 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
   if (args.opcode == 0b000011) {
     FpRegister val = GetVRegScalar(args.rn, is_double);
     if (is_double) {
-      builder_.Gen<x86_64::SqrtsdXRegXReg>(val.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::SqrtsdXRegXReg>(val.machine_reg(), val.machine_reg());
     } else {
-      builder_.Gen<x86_64::SqrtssXRegXReg>(val.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::SqrtssXRegXReg>(val.machine_reg(), val.machine_reg());
     }
     SetVRegScalar(args.rd, val, is_double);
     return;
@@ -4880,11 +4872,9 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     if (is_frint) {
       FpRegister val = GetVRegScalar(args.rn, is_double);
       if (is_double) {
-        builder_.Gen<x86_64::RoundsdXRegXRegImm>(
-            val.machine_reg(), val.machine_reg(), round_imm);
+        GenRaw<x86_64::RoundsdXRegXRegImm>(val.machine_reg(), val.machine_reg(), round_imm);
       } else {
-        builder_.Gen<x86_64::RoundpsXRegXRegImm>(
-            val.machine_reg(), val.machine_reg(), round_imm);
+        GenRaw<x86_64::RoundpsXRegXRegImm>(val.machine_reg(), val.machine_reg(), round_imm);
       }
       SetVRegScalar(args.rd, val, is_double);
       return;
@@ -4912,42 +4902,38 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     FpRegister thresh = AllocTempSimdReg();
     if (is_double) {
       // addend = copysign(0.5d, x) = (x & sign_bit) | bits(0.5d).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
-      builder_.Gen<x86_64::MovqXRegReg>(half.machine_reg(),
-                                        GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
-      builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});  // 0x8000...0
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(half.machine_reg(),
+                                  GetImm(uint64_t{0x3FE0000000000000}));  // 0.5d
+      GenRaw<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
       // gate = (|x| < 2^52) ? all-ones : 0, via thresh > |x|.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
-      builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
-      builder_.Gen<x86_64::MovqXRegReg>(thresh.machine_reg(),
-                                        GetImm(uint64_t{0x4330000000000000}));  // 2^52
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
-      builder_.Gen<x86_64::AddpdXRegXReg>(val.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::RoundsdXRegXRegImm>(
-          val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PsrlqXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFF...F
+      GenRaw<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(thresh.machine_reg(),
+                                  GetImm(uint64_t{0x4330000000000000}));  // 2^52
+      GenRaw<x86_64::PcmpgtqXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+      GenRaw<x86_64::AddpdXRegXReg>(val.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::RoundsdXRegXRegImm>(val.machine_reg(), val.machine_reg(), int8_t{0x03});
     } else {
       // addend = copysign(0.5f, x) = (x & sign_bit) | bits(0.5f).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(),
-                                        GetImm(uint64_t{0x3F000000}));  // 0.5f
-      builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+      GenRaw<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
       // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x|.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
-      builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(),
-                                        GetImm(uint64_t{0x4B000000}));  // 2^23
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
-      builder_.Gen<x86_64::AddpsXRegXReg>(val.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(
-          val.machine_reg(), val.machine_reg(), int8_t{0x03});
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+      GenRaw<x86_64::PandXRegXReg>(absx.machine_reg(), val.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+      GenRaw<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+      GenRaw<x86_64::AddpsXRegXReg>(val.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::RoundpsXRegXRegImm>(val.machine_reg(), val.machine_reg(), int8_t{0x03});
     }
     SetVRegScalar(args.rd, val, is_double);
     return;
@@ -4971,16 +4957,16 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     if (is_double) {
       uint64_t m = (args.opcode == 0b000001) ? 0x7FFFFFFFFFFFFFFFULL : 0x8000000000000000ULL;
       Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(m)));
-      builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
+      GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
     } else {
       uint32_t m = (args.opcode == 0b000001) ? 0x7FFFFFFFu : 0x80000000u;
       Register gm = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(m)));
-      builder_.Gen<x86_64::MovdXRegReg>(mask.machine_reg(), gm);
+      GenRaw<x86_64::MovdXRegReg>(mask.machine_reg(), gm);
     }
     if (args.opcode == 0b000001) {  // FABS
-      builder_.Gen<x86_64::PandXRegXReg>(val.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(val.machine_reg(), mask.machine_reg());
     } else {  // FNEG
-      builder_.Gen<x86_64::XorpdXRegXReg>(val.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::XorpdXRegXReg>(val.machine_reg(), mask.machine_reg());
     }
   }
   SetVRegScalar(args.rd, val, is_double);
@@ -5028,16 +5014,16 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
     switch (args.opcode) {
       case 0b0000:    // FMUL
       case 0b1000:    // FNMUL: -(n*m) — sign flipped below
-        builder_.Gen<x86_64::MulssXRegXReg>(n.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::MulssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
       case 0b0001:    // FDIV
-        builder_.Gen<x86_64::DivssXRegXReg>(n.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::DivssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
       case 0b0010:    // FADD
-        builder_.Gen<x86_64::AddssXRegXReg>(n.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::AddssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
       case 0b0011:    // FSUB
-        builder_.Gen<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
       case 0b0100:    // FMAX
       case 0b0101:    // FMIN
@@ -5053,8 +5039,8 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
     if (args.opcode == 0b1000) {
       // FNMUL: flip lane-0 FP32 sign; lanes 1..3 (=+0.0) XOR 0 stay +0.0.
       FpRegister sign = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdXRegReg>(sign.machine_reg(), GetImm(uint64_t{0x80000000u}));
-      builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(sign.machine_reg(), GetImm(uint64_t{0x80000000u}));
+      GenRaw<x86_64::PxorXRegXReg>(result.machine_reg(), sign.machine_reg());
     }
     EmitNarrowF32ToHalfAndStore(args.rd, result);
     return;
@@ -5122,13 +5108,13 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
     if (is_double) {
       Register gs = std::get<0>(Gen<x86_64::MovqRegImm>(
           static_cast<int64_t>(0x8000000000000000ULL)));
-      builder_.Gen<x86_64::MovqXRegReg>(sign.machine_reg(), gs);
+      GenRaw<x86_64::MovqXRegReg>(sign.machine_reg(), gs);
     } else {
       Register gs = std::get<0>(Gen<x86_64::MovlRegImm>(
           static_cast<int32_t>(0x80000000u)));
-      builder_.Gen<x86_64::MovdXRegReg>(sign.machine_reg(), gs);
+      GenRaw<x86_64::MovdXRegReg>(sign.machine_reg(), gs);
     }
-    builder_.Gen<x86_64::XorpdXRegXReg>(result.machine_reg(), sign.machine_reg());
+    GenRaw<x86_64::XorpdXRegXReg>(result.machine_reg(), sign.machine_reg());
   }
   SetVRegScalar(args.rd, result, is_double);
 }
@@ -5165,30 +5151,29 @@ void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
     // Sign-bit mask for 64-bit FP lanes: [0x8000000000000000]*2. A self-Pcmpeq must
     // start from a zeroed reg to avoid a use-before-def lifetime check.
     FpRegister sign = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-    builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
+    GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+    GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
 
     // Negate exactly the real (lane0) or imag (lane1) 64-bit slot, then XOR into xm.
     auto negate_lane = [&](bool negate_real) {
       FpRegister lane = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
       if (negate_real) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(lane.machine_reg(), int8_t{8});  // lane0
+        GenRaw<x86_64::PsrldqXRegImm>(lane.machine_reg(), int8_t{8});  // lane0
       } else {
-        builder_.Gen<x86_64::PslldqXRegImm>(lane.machine_reg(), int8_t{8});  // lane1
+        GenRaw<x86_64::PslldqXRegImm>(lane.machine_reg(), int8_t{8});  // lane1
       }
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
-      builder_.Gen<x86_64::XorpdXRegXReg>(xm.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
+      GenRaw<x86_64::XorpdXRegXReg>(xm.machine_reg(), sign.machine_reg());
     };
 
     FpRegister result;
     if (!is_fcmla) {
       // FCADD: pair-swap Vm (SHUFPD 0x01 -> [im, re]); rot==0 (#90) negates real,
       // rot==1 (#270) negates imag; then Vn + Vm_xformed.
-      builder_.Gen<x86_64::ShufpdXRegXRegImm>(
-          xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
+      GenRaw<x86_64::ShufpdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
       negate_lane(/*negate_real=*/args.rot == 0);
-      builder_.Gen<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
       result = xn;
     } else {
       // FCMLA: result = Vd + broadcast(Vn) * Vm_xformed.
@@ -5198,25 +5183,23 @@ void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
         case 0:
           break;
         case 1:  // swap + negate real
-          builder_.Gen<x86_64::ShufpdXRegXRegImm>(
-              xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
+          GenRaw<x86_64::ShufpdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
           negate_lane(/*negate_real=*/true);
           break;
         case 2:  // negate both lanes
-          builder_.Gen<x86_64::XorpdXRegXReg>(xm.machine_reg(), sign.machine_reg());
+          GenRaw<x86_64::XorpdXRegXReg>(xm.machine_reg(), sign.machine_reg());
           break;
         default:  // rot == 3: swap + negate imag
-          builder_.Gen<x86_64::ShufpdXRegXRegImm>(
-              xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
+          GenRaw<x86_64::ShufpdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x01});
           negate_lane(/*negate_real=*/false);
           break;
       }
       // Broadcast n_re (rot 0/2, SHUFPD 0x00) or n_im (rot 1/3, SHUFPD 0x03).
       const int8_t bcast =
           (args.rot == 0 || args.rot == 2) ? int8_t{0x00} : int8_t{0x03};
-      builder_.Gen<x86_64::ShufpdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), bcast);
-      builder_.Gen<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::AddpdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::ShufpdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), bcast);
+      GenRaw<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::AddpdXRegXReg>(xd.machine_reg(), xn.machine_reg());
       result = xd;
     }
     // FP64 is always Q=1; SetVRegFull(q=true) stores the full 128 bits.
@@ -5232,31 +5215,31 @@ void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
   // Sign-bit mask [0x80000000]*4. A self-Pcmpeq must start from a zeroed reg to
   // avoid a use-before-def lifetime check on a fresh temp.
   FpRegister sign = AllocZeroedSimdReg();
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
 
   // Negate exactly the lanes selected by a [-1] mask shifted into either the
   // real (lanes 0,2) or imag (lanes 1,3) 32-bit slots, then XOR into Vm.
   auto negate_lanes = [&](bool negate_real) {
     FpRegister lane = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
     if (negate_real) {
-      builder_.Gen<x86_64::PsrlqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 0,2
+      GenRaw<x86_64::PsrlqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 0,2
     } else {
-      builder_.Gen<x86_64::PsllqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 1,3
+      GenRaw<x86_64::PsllqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 1,3
     }
-    builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
   };
 
   FpRegister result;
   if (!is_fcmla) {
     // FCADD: swap real/imag of Vm; rot==0 (#90) negates real, rot==1 (#270)
     // negates imag; then Vn + Vm_xformed.
-    builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+    GenRaw<x86_64::ShufpsXRegXRegImm>(
         xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
     negate_lanes(/*negate_real=*/args.rot == 0);
-    builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
     result = xn;
   } else {
     // FCMLA: result = Vd + broadcast(Vn) * Vm_xformed.
@@ -5266,15 +5249,15 @@ void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
       case 0:
         break;
       case 1:  // swap + negate real
-        builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+        GenRaw<x86_64::ShufpsXRegXRegImm>(
             xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
         negate_lanes(/*negate_real=*/true);
         break;
       case 2:  // negate both lanes
-        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
         break;
       default:  // rot == 3: swap + negate imag
-        builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+        GenRaw<x86_64::ShufpsXRegXRegImm>(
             xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
         negate_lanes(/*negate_real=*/false);
         break;
@@ -5284,17 +5267,17 @@ void HeavyOptimizerFrontend::AdvSimdFcma(const Decoder::FcmaArgs& args) {
                                                           : static_cast<int8_t>(0xF5);
     FpRegister n_bcast =
         FpRegister{std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), bcast))};
-    builder_.Gen<x86_64::MulpsXRegXReg>(n_bcast.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::AddpsXRegXReg>(xd.machine_reg(), n_bcast.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(n_bcast.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(xd.machine_reg(), n_bcast.machine_reg());
     result = xd;
   }
 
   // Q=0 (.2s): zero the upper 64 bits of Vd (D-form).
   if (!args.q) {
     FpRegister lane = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
-    builder_.Gen<x86_64::PsrldqXRegImm>(lane.machine_reg(), int8_t{8});
-    builder_.Gen<x86_64::PandXRegXReg>(result.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PsrldqXRegImm>(lane.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PandXRegXReg>(result.machine_reg(), lane.machine_reg());
   }
   builder_.GenSetSimd<16>(vd_off, result.machine_reg());
 }
@@ -5332,35 +5315,35 @@ void HeavyOptimizerFrontend::AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
   // Sign-bit mask [0x80000000]*4 (self-Pcmpeq off a zeroed reg to satisfy the
   // use-before-def lifetime check on a fresh temp).
   FpRegister sign = AllocZeroedSimdReg();
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
 
   // Negate the real (lanes 0,2) or imag (lanes 1,3) 32-bit slots of Vm.
   auto negate_lanes = [&](bool negate_real) {
     FpRegister lane = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(lane.machine_reg(), lane.machine_reg());
     if (negate_real) {
-      builder_.Gen<x86_64::PsrlqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 0,2
+      GenRaw<x86_64::PsrlqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 0,2
     } else {
-      builder_.Gen<x86_64::PsllqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 1,3
+      GenRaw<x86_64::PsllqXRegImm>(lane.machine_reg(), int8_t{32});  // lanes 1,3
     }
-    builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), lane.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
   };
 
   switch (args.rot) {
     case 0:
       break;
     case 1:  // swap pair + negate real
-      builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+      GenRaw<x86_64::ShufpsXRegXRegImm>(
           xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
       negate_lanes(/*negate_real=*/true);
       break;
     case 2:  // negate both lanes
-      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
       break;
     default:  // rot == 3: swap pair + negate imag
-      builder_.Gen<x86_64::ShufpsXRegXRegImm>(
+      GenRaw<x86_64::ShufpsXRegXRegImm>(
           xm.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xB1));
       negate_lanes(/*negate_real=*/false);
       break;
@@ -5371,8 +5354,8 @@ void HeavyOptimizerFrontend::AdvSimdFcmaIdx(const Decoder::FcmaIdxArgs& args) {
                                                         : static_cast<int8_t>(0xF5);
   FpRegister n_bcast =
       FpRegister{std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), bcast))};
-  builder_.Gen<x86_64::MulpsXRegXReg>(n_bcast.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::AddpsXRegXReg>(xd.machine_reg(), n_bcast.machine_reg());
+  GenRaw<x86_64::MulpsXRegXReg>(n_bcast.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::AddpsXRegXReg>(xd.machine_reg(), n_bcast.machine_reg());
   // FP32-indexed FCMLA mandates Q=1 (decoder rejects Q=0), so no D-form clear.
   builder_.GenSetSimd<16>(vd_off, xd.machine_reg());
 }
@@ -5407,7 +5390,7 @@ void HeavyOptimizerFrontend::AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameAr
   // lifts each 16-bit BF16 into the high half of its dword = Bf16ToFloat).
   auto widen_bf = [&](FpRegister src) -> FpRegister {
     FpRegister r = FpRegister{std::get<0>(Gen<x86_64::PmovzxwdXRegXReg>(src.machine_reg()))};
-    builder_.Gen<x86_64::PslldXRegImm>(r.machine_reg(), int8_t{16});
+    GenRaw<x86_64::PslldXRegImm>(r.machine_reg(), int8_t{16});
     return r;
   };
   // High 8 bytes of `src` moved into the low 8 (PSHUFD 0x0E).
@@ -5430,25 +5413,25 @@ void HeavyOptimizerFrontend::AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameAr
 
     // Row 0: dots (0,0) and (0,1). Copy n0 so it survives the second MULPS.
     FpRegister r0 = FpRegister{std::get<0>(Gen<x86_64::MovdqaXRegXReg>(n0.machine_reg()))};
-    builder_.Gen<x86_64::MulpsXRegXReg>(r0.machine_reg(), m0.machine_reg());
-    builder_.Gen<x86_64::MulpsXRegXReg>(n0.machine_reg(), m1.machine_reg());
-    builder_.Gen<x86_64::HaddpsXRegXReg>(r0.machine_reg(), n0.machine_reg());
-    builder_.Gen<x86_64::HaddpsXRegXReg>(r0.machine_reg(), r0.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(r0.machine_reg(), m0.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(n0.machine_reg(), m1.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(r0.machine_reg(), n0.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(r0.machine_reg(), r0.machine_reg());
     // r0[63:0] = (dot00, dot01).
 
     // Row 1: dots (1,0) and (1,1).
     FpRegister r1 = FpRegister{std::get<0>(Gen<x86_64::MovdqaXRegXReg>(n1.machine_reg()))};
-    builder_.Gen<x86_64::MulpsXRegXReg>(r1.machine_reg(), m0.machine_reg());
-    builder_.Gen<x86_64::MulpsXRegXReg>(n1.machine_reg(), m1.machine_reg());
-    builder_.Gen<x86_64::HaddpsXRegXReg>(r1.machine_reg(), n1.machine_reg());
-    builder_.Gen<x86_64::HaddpsXRegXReg>(r1.machine_reg(), r1.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(r1.machine_reg(), m0.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(n1.machine_reg(), m1.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(r1.machine_reg(), n1.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(r1.machine_reg(), r1.machine_reg());
     // r1[63:0] = (dot10, dot11).
 
     // Pack: MOVLHPS r0, r1 -> [dot00, dot01, dot10, dot11].
-    builder_.Gen<x86_64::MovlhpsXRegXReg>(r0.machine_reg(), r1.machine_reg());
+    GenRaw<x86_64::MovlhpsXRegXReg>(r0.machine_reg(), r1.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::AddpsXRegXReg>(r0.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(r0.machine_reg(), vd.machine_reg());
     builder_.GenSetSimd<16>(vd_off, r0.machine_reg());
     return;
   }
@@ -5466,9 +5449,9 @@ void HeavyOptimizerFrontend::AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameAr
     FpRegister xn = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     if (is_t) {
-      builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
     }
-    builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+    GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
 
     FpRegister xm;
     if (is_idx) {
@@ -5481,22 +5464,22 @@ void HeavyOptimizerFrontend::AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameAr
       xm = FpRegister{std::get<0>(Gen<x86_64::PshufdXRegXRegImm>(
           vm.machine_reg(), static_cast<int8_t>(d * 0x55)))};
       if (args.index & 1) {
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
       }
-      builder_.Gen<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
     } else {
       xm = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
       if (is_t) {
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
       }
-      builder_.Gen<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
     }
 
-    builder_.Gen<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), vd.machine_reg());
     builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
     return;
   }
@@ -5519,27 +5502,27 @@ void HeavyOptimizerFrontend::AdvSimdBf16ThreeSame(const Decoder::Bf16ThreeSameAr
     m_lo = widen_bf(vm);
   }
   FpRegister n_lo = widen_bf(vn);
-  builder_.Gen<x86_64::MulpsXRegXReg>(n_lo.machine_reg(), m_lo.machine_reg());
+  GenRaw<x86_64::MulpsXRegXReg>(n_lo.machine_reg(), m_lo.machine_reg());
 
   if (args.q) {
     FpRegister n_hi = widen_bf(high_half(vn));
     FpRegister m_hi = is_idx ? m_lo : widen_bf(high_half(vm));
-    builder_.Gen<x86_64::MulpsXRegXReg>(n_hi.machine_reg(), m_hi.machine_reg());
+    GenRaw<x86_64::MulpsXRegXReg>(n_hi.machine_reg(), m_hi.machine_reg());
     // [p0+p1, p2+p3, p4+p5, p6+p7] = the 4 output lanes.
-    builder_.Gen<x86_64::HaddpsXRegXReg>(n_lo.machine_reg(), n_hi.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(n_lo.machine_reg(), n_hi.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::AddpsXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
     builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
   } else {
     // .2s: 2 lanes. HADDPS vs a zeroed reg -> [lane0, lane1, 0, 0]; accumulate
     // Vd, then PUNPCKLQDQ with zero keeps the low 64 and clears the D-form upper.
     FpRegister zero = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::HaddpsXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
+    GenRaw<x86_64::HaddpsXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::AddpsXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
     builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
   }
 }
@@ -5585,20 +5568,20 @@ void HeavyOptimizerFrontend::AdvSimdMatMul(const Decoder::MatMulArgs& args) {
 
   // p00, p01, p10, p11 (each PMADDWD gives 4 partial int32; PHADDD folds later).
   FpRegister a = FpRegister{std::get<0>(Gen<x86_64::MovdqaXRegXReg>(n0.machine_reg()))};
-  builder_.Gen<x86_64::PmaddwdXRegXReg>(a.machine_reg(), m0.machine_reg());   // p00
+  GenRaw<x86_64::PmaddwdXRegXReg>(a.machine_reg(), m0.machine_reg());  // p00
   FpRegister b = FpRegister{std::get<0>(Gen<x86_64::MovdqaXRegXReg>(n0.machine_reg()))};
-  builder_.Gen<x86_64::PmaddwdXRegXReg>(b.machine_reg(), m1.machine_reg());   // p01
+  GenRaw<x86_64::PmaddwdXRegXReg>(b.machine_reg(), m1.machine_reg());  // p01
   FpRegister c = FpRegister{std::get<0>(Gen<x86_64::MovdqaXRegXReg>(n1.machine_reg()))};
-  builder_.Gen<x86_64::PmaddwdXRegXReg>(c.machine_reg(), m0.machine_reg());   // p10
-  builder_.Gen<x86_64::PmaddwdXRegXReg>(n1.machine_reg(), m1.machine_reg());  // p11 (in place)
+  GenRaw<x86_64::PmaddwdXRegXReg>(c.machine_reg(), m0.machine_reg());   // p10
+  GenRaw<x86_64::PmaddwdXRegXReg>(n1.machine_reg(), m1.machine_reg());  // p11 (in place)
 
-  builder_.Gen<x86_64::PhadddXRegXReg>(a.machine_reg(), b.machine_reg());   // pair-sums p00|p01
-  builder_.Gen<x86_64::PhadddXRegXReg>(c.machine_reg(), n1.machine_reg());  // pair-sums p10|p11
-  builder_.Gen<x86_64::PhadddXRegXReg>(a.machine_reg(), c.machine_reg());   // [d00,d01,d10,d11]
+  GenRaw<x86_64::PhadddXRegXReg>(a.machine_reg(), b.machine_reg());   // pair-sums p00|p01
+  GenRaw<x86_64::PhadddXRegXReg>(c.machine_reg(), n1.machine_reg());  // pair-sums p10|p11
+  GenRaw<x86_64::PhadddXRegXReg>(a.machine_reg(), c.machine_reg());   // [d00,d01,d10,d11]
 
   FpRegister vd = AllocTempSimdReg();
   builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-  builder_.Gen<x86_64::PadddXRegXReg>(a.machine_reg(), vd.machine_reg());
+  GenRaw<x86_64::PadddXRegXReg>(a.machine_reg(), vd.machine_reg());
   builder_.GenSetSimd<16>(vd_off, a.machine_reg());
 }
 
@@ -5653,28 +5636,28 @@ void HeavyOptimizerFrontend::AdvSimdDotProduct(const Decoder::DotProductArgs& ar
     m_lo = widen(vm, m_signed);
   }
   FpRegister n_lo = widen(vn, n_signed);
-  builder_.Gen<x86_64::PmaddwdXRegXReg>(n_lo.machine_reg(), m_lo.machine_reg());
+  GenRaw<x86_64::PmaddwdXRegXReg>(n_lo.machine_reg(), m_lo.machine_reg());
 
   if (args.q) {
     FpRegister n_hi = widen(high_half(vn), n_signed);
     FpRegister m_hi = is_indexed ? m_lo : widen(high_half(vm), m_signed);
-    builder_.Gen<x86_64::PmaddwdXRegXReg>(n_hi.machine_reg(), m_hi.machine_reg());
+    GenRaw<x86_64::PmaddwdXRegXReg>(n_hi.machine_reg(), m_hi.machine_reg());
     // Fold adjacent int32 pairs: lanes become [n_lo01, n_lo23, n_hi01, n_hi23].
-    builder_.Gen<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_hi.machine_reg());
+    GenRaw<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_hi.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
     builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
   } else {
     // .2s: only 2 lanes. PHADDD n_lo,n_lo folds the low half into [p01, p23, ..].
-    builder_.Gen<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_lo.machine_reg());
+    GenRaw<x86_64::PhadddXRegXReg>(n_lo.machine_reg(), n_lo.machine_reg());
     FpRegister vd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(vd.machine_reg(), vd_off);
-    builder_.Gen<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
+    GenRaw<x86_64::PadddXRegXReg>(n_lo.machine_reg(), vd.machine_reg());
     // D-form zeroes the upper 64 bits of Vd; PUNPCKLQDQ with a zeroed reg keeps
     // the low 64 (the 2 result lanes) and clears the high 64.
     FpRegister zero = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(n_lo.machine_reg(), zero.machine_reg());
     builder_.GenSetSimd<16>(vd_off, n_lo.machine_reg());
   }
 }
@@ -5716,11 +5699,11 @@ void HeavyOptimizerFrontend::SimdModifiedImm(const Decoder::SimdModifiedImmArgs&
   FpRegister ximm = AllocZeroedSimdReg();
   if (lo != 0) {
     Register glo = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(lo)));
-    builder_.Gen<x86_64::MovqXRegReg>(ximm.machine_reg(), glo);  // zero-extends upper 64
+    GenRaw<x86_64::MovqXRegReg>(ximm.machine_reg(), glo);  // zero-extends upper 64
   }
   if (hi != 0) {
     Register ghi = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(hi)));
-    builder_.Gen<x86_64::PinsrqXRegRegImm>(ximm.machine_reg(), ghi, int8_t{1});
+    GenRaw<x86_64::PinsrqXRegRegImm>(ximm.machine_reg(), ghi, int8_t{1});
   }
 
   if (!is_orr_bic) {
@@ -5736,12 +5719,12 @@ void HeavyOptimizerFrontend::SimdModifiedImm(const Decoder::SimdModifiedImmArgs&
   FpRegister xd = AllocTempSimdReg();
   builder_.GenGetSimd<16>(xd.machine_reg(), off);
   if (args.op == 0) {
-    builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), ximm.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xd.machine_reg(), ximm.machine_reg());
     SetVRegFull(args.rd, xd, args.q);
   } else {
     // BIC: xd = ~imm & Vd. PANDN(dst, src) computes dst = ~dst & src, so with
     // dst=ximm, src=xd we get ~imm & Vd; the result lands in ximm.
-    builder_.Gen<x86_64::PandnXRegXReg>(ximm.machine_reg(), xd.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(ximm.machine_reg(), xd.machine_reg());
     SetVRegFull(args.rd, ximm, args.q);
   }
 }
@@ -5774,7 +5757,7 @@ void HeavyOptimizerFrontend::EmitSimdLoadStoreNarrow(bool is_store,
                       : std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = masked, .disp = disp}));
   GenRecoveryBlockForLastInsn();
   FpRegister xmm = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdXRegReg>(xmm.machine_reg(), data);
+  GenRaw<x86_64::MovdXRegReg>(xmm.machine_reg(), data);
   builder_.GenSetSimd<16>(vreg_off, xmm.machine_reg());
 }
 
@@ -5803,13 +5786,13 @@ void HeavyOptimizerFrontend::SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArg
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
     switch (args.size) {
       case Decoder::SimdLoadStoreSize::k128bit:
-        builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+        GenRaw<x86_64::MovdquOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
         break;
       case Decoder::SimdLoadStoreSize::k64bit:
-        builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+        GenRaw<x86_64::MovsdOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
         break;
       default:  // k32bit
-        builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
+        GenRaw<x86_64::MovssOpXReg>({.base = masked, .disp = off}, xmm.machine_reg());
         break;
     }
     GenRecoveryBlockForLastInsn();
@@ -5862,24 +5845,21 @@ void HeavyOptimizerFrontend::SimdLoadStorePair(const Decoder::SimdLoadStorePairA
     builder_.GenGetSimd<16>(xmm2.machine_reg(), v2_off);
     switch (args.size) {
       case Decoder::SimdLoadStoreSize::k128bit:
-        builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
+        GenRaw<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
         GenRecoveryBlockForLastInsn();
-        builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = element_size},
-                                           xmm2.machine_reg());
+        GenRaw<x86_64::MovdquOpXReg>({.base = masked, .disp = element_size}, xmm2.machine_reg());
         GenRecoveryBlockForLastInsn();
         break;
       case Decoder::SimdLoadStoreSize::k64bit:
-        builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
+        GenRaw<x86_64::MovsdOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
         GenRecoveryBlockForLastInsn();
-        builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = element_size},
-                                          xmm2.machine_reg());
+        GenRaw<x86_64::MovsdOpXReg>({.base = masked, .disp = element_size}, xmm2.machine_reg());
         GenRecoveryBlockForLastInsn();
         break;
       default:  // k32bit
-        builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
+        GenRaw<x86_64::MovssOpXReg>({.base = masked, .disp = 0}, xmm1.machine_reg());
         GenRecoveryBlockForLastInsn();
-        builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = element_size},
-                                          xmm2.machine_reg());
+        GenRaw<x86_64::MovssOpXReg>({.base = masked, .disp = element_size}, xmm2.machine_reg());
         GenRecoveryBlockForLastInsn();
         break;
     }
@@ -5940,13 +5920,13 @@ void HeavyOptimizerFrontend::SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArg
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
     switch (args.size) {
       case Decoder::SimdLoadStoreSize::k128bit:
-        builder_.Gen<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+        GenRaw<x86_64::MovdquOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
         break;
       case Decoder::SimdLoadStoreSize::k64bit:
-        builder_.Gen<x86_64::MovsdOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+        GenRaw<x86_64::MovsdOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
         break;
       default:  // k32bit
-        builder_.Gen<x86_64::MovssOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
+        GenRaw<x86_64::MovssOpXReg>({.base = masked, .disp = 0}, xmm.machine_reg());
         break;
     }
     GenRecoveryBlockForLastInsn();
@@ -6023,16 +6003,16 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
                                   : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
     switch (esize) {
       case 1:
-        builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), src, lane);
+        GenRaw<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), src, lane);
         break;
       case 2:
-        builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
+        GenRaw<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
         break;
       case 4:
-        builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
+        GenRaw<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
         break;
       default:
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), src, lane);
+        GenRaw<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), src, lane);
         break;
     }
     builder_.GenSetSimd<16>(off, xmm.machine_reg());
@@ -6185,29 +6165,25 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
       case 1: {
         Register t = std::get<0>(
             Gen<x86_64::PextrbRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
-        builder_.Gen<x86_64::PinsrbXRegRegImm>(
-            xd.machine_reg(), t, static_cast<int8_t>(index));
+        GenRaw<x86_64::PinsrbXRegRegImm>(xd.machine_reg(), t, static_cast<int8_t>(index));
         break;
       }
       case 2: {
         Register t = std::get<0>(
             Gen<x86_64::PextrwRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
-        builder_.Gen<x86_64::PinsrwXRegRegImm>(
-            xd.machine_reg(), t, static_cast<int8_t>(index));
+        GenRaw<x86_64::PinsrwXRegRegImm>(xd.machine_reg(), t, static_cast<int8_t>(index));
         break;
       }
       case 4: {
         Register t = std::get<0>(
             Gen<x86_64::PextrdRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
-        builder_.Gen<x86_64::PinsrdXRegRegImm>(
-            xd.machine_reg(), t, static_cast<int8_t>(index));
+        GenRaw<x86_64::PinsrdXRegRegImm>(xd.machine_reg(), t, static_cast<int8_t>(index));
         break;
       }
       default: {
         Register t = std::get<0>(
             Gen<x86_64::PextrqRegXRegImm>(xn.machine_reg(), static_cast<int8_t>(src_index)));
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(
-            xd.machine_reg(), t, static_cast<int8_t>(index));
+        GenRaw<x86_64::PinsrqXRegRegImm>(xd.machine_reg(), t, static_cast<int8_t>(index));
         break;
       }
     }
@@ -6270,16 +6246,16 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
       Register r =
           std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(mask_qword)));
       FpRegister mask = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), r);
-      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(mask.machine_reg(), mask.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(xmm.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), r);
+      GenRaw<x86_64::PunpcklqdqXRegXReg>(mask.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(xmm.machine_reg(), mask.machine_reg());
     } else if (esize == 4) {
       const int8_t imm = static_cast<int8_t>(static_cast<uint8_t>(index * 0x55));
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
     } else {  // esize == 8, Q=1
       const int8_t imm =
           (index == 0) ? static_cast<int8_t>(0x44) : static_cast<int8_t>(0xEE);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(xmm.machine_reg(), xmm.machine_reg(), imm);
     }
     SetVRegFull(args.rd, xmm, args.q);
     return;
@@ -6314,11 +6290,11 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
     builder_.GenGetSimd<16>(xmm.machine_reg(), GetVRegOffset(args.rn));
     const int8_t elem_off = static_cast<int8_t>(index * esize);
     if (elem_off != 0) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xmm.machine_reg(), elem_off);
+      GenRaw<x86_64::PsrldqXRegImm>(xmm.machine_reg(), elem_off);
     }
     const int8_t clear = static_cast<int8_t>(16 - esize);
-    builder_.Gen<x86_64::PslldqXRegImm>(xmm.machine_reg(), clear);
-    builder_.Gen<x86_64::PsrldqXRegImm>(xmm.machine_reg(), clear);
+    GenRaw<x86_64::PslldqXRegImm>(xmm.machine_reg(), clear);
+    GenRaw<x86_64::PsrldqXRegImm>(xmm.machine_reg(), clear);
     builder_.GenSetSimd<16>(GetVRegOffset(args.rd), xmm.machine_reg());
     return;
   }
@@ -6349,18 +6325,18 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
 
   if (esize_bits == 0x08) {  // D (Q==1 only): 2D broadcast.
     FpRegister xmm = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovqXRegReg>(xmm.machine_reg(), src);          // low qword = src, upper = 0
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm.machine_reg(), xmm.machine_reg());  // dup low qword
+    GenRaw<x86_64::MovqXRegReg>(xmm.machine_reg(), src);  // low qword = src, upper = 0
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(xmm.machine_reg(), xmm.machine_reg());  // dup low qword
     builder_.GenSetSimd<16>(off, xmm.machine_reg());
     return;
   }
 
   if (esize_bits == 0x01) {  // B: byte broadcast.
     FpRegister xmm = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdXRegReg>(xmm.machine_reg(), src);  // byte 0 in lane 0
+    GenRaw<x86_64::MovdXRegReg>(xmm.machine_reg(), src);  // byte 0 in lane 0
     // PSHUFB with an all-zero mask selects byte 0 for every output byte.
     FpRegister zero_mask = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PshufbXRegXReg>(xmm.machine_reg(), zero_mask.machine_reg());
+    GenRaw<x86_64::PshufbXRegXReg>(xmm.machine_reg(), zero_mask.machine_reg());
     // PSHUFB filled all 16 bytes; for Q==0 we still must zero the upper half.
     SetVRegFull(args.rd, xmm, args.q);
     return;
@@ -6372,7 +6348,7 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
     FpRegister xmm = AllocZeroedSimdReg();
     const int8_t n = args.q ? int8_t{8} : int8_t{4};
     for (int8_t lane = 0; lane < n; ++lane) {
-      builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
+      GenRaw<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), src, lane);
     }
     SetVRegFull(args.rd, xmm, args.q);
     return;
@@ -6382,7 +6358,7 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
   FpRegister xmm = AllocZeroedSimdReg();
   const int8_t n = args.q ? int8_t{4} : int8_t{2};
   for (int8_t lane = 0; lane < n; ++lane) {
-    builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
+    GenRaw<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), src, lane);
   }
   SetVRegFull(args.rd, xmm, args.q);
 }
@@ -6412,15 +6388,15 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegi
       FpRegister xn_corner = AllocTempSimdReg();
       FpRegister xm_corner = AllocTempSimdReg();
       FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
-      builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+      GenRaw<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
       return xn;
     }
     // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
@@ -6429,20 +6405,21 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegi
     FpRegister xn_corner = AllocTempSimdReg();
     FpRegister xm_corner = AllocTempSimdReg();
     FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
-    builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
-    builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
-    builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
-    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
+    GenRaw<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
+    GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
+    GenRaw<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
+    GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
+    GenRaw<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+    GenRaw<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(),
+                                 xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
     return xn;
   }
   // size=10 .2S/.4S: PMULDQ widen (SSE4.1) + PSLLQ double + optional round
@@ -6453,40 +6430,42 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegi
   FpRegister xp_hi = AllocTempSimdReg();
   FpRegister xm_hi = AllocTempSimdReg();
   // x_const = INT32_MIN broadcast across 4 dwords.
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
   // Corner: lanes where Vn.s[i] == INT32_MIN AND Vm.s[i] == INT32_MIN.
-  builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
   // Two PMULDQs reconstruct the 4 signed 32x32 -> 64 products (even lanes
   // in xp_lo, odd lanes in xp_hi).
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
-  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
+  GenRaw<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
+  GenRaw<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
   // Double each 64-bit signed product.
-  builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
-  builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
+  GenRaw<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
+  GenRaw<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
   if (is_round) {
     // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
-    builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
-    builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+    GenRaw<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
+    GenRaw<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
   }
   // Extract the upper 32 bits of each 64-bit lane and interleave.
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
-  builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
+  GenRaw<x86_64::PshufdXRegXRegImm>(
+      xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
+  GenRaw<x86_64::PshufdXRegXRegImm>(
+      xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
+  GenRaw<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
   // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
-  builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
+  GenRaw<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
   return xp_lo;
 }
 
@@ -6509,37 +6488,37 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitArmFpMinMax(FpReg
     // AllocZeroedSimdReg establishes a def before the all-ones self-compare
     // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
     sign_mask = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
     if (is_double) {
-      builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
+      GenRaw<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
     } else {
-      builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
     }
-    builder_.Gen<x86_64::PxorXRegXReg>(n.machine_reg(), sign_mask.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(m.machine_reg(), sign_mask.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(n.machine_reg(), sign_mask.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(m.machine_reg(), sign_mask.machine_reg());
   }
   auto gen_min = [&](FpRegister dst, FpRegister src) {
     if (is_double) {
-      builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
     } else {
-      builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
     }
   };
   auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
     if (is_double) {
-      builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
     } else {
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
     }
   };
   FpRegister result;
   if (!is_nm) {
     // NaN-propagating: tmp = m; MIN(tmp, n); MIN(n, m); POR(n, tmp).
     FpRegister tmp = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
     gen_min(tmp, n);
     gen_min(n, m);
-    builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
     result = n;
   } else {
     // NaN-suppressing: substitute each NaN lane with the other operand
@@ -6548,30 +6527,30 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitArmFpMinMax(FpReg
     FpRegister mask_b = AllocTempSimdReg();
     FpRegister an_sub = AllocTempSimdReg();
     FpRegister bn_sub = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
     gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
     gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
-    builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());  // mask_a & b
-    builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());  // mask_b & a
-    builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());  // ~mask_a & a
-    builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());  // ~mask_b & b
-    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
-    builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
+    GenRaw<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());  // mask_a & b
+    GenRaw<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());      // mask_b & a
+    GenRaw<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());     // ~mask_a & a
+    GenRaw<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());     // ~mask_b & b
+    GenRaw<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
+    GenRaw<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
     // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
     // operands are NaN-free here (NaN lanes were substituted above).
     FpRegister t_nm = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
     gen_min(t_nm, mask_a);      // min(b', a')
     gen_min(mask_a, mask_b);    // min(a', b')
-    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
     result = mask_a;
   }
   // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
   if (is_max) {
-    builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
   }
   return result;
 }
@@ -6645,30 +6624,30 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     // PUNPCKLQDQ broadcasts the low 64 into the high 64).
     FpRegister xbit = AllocTempSimdReg();
     Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0101010101010101LL}));
-    builder_.Gen<x86_64::MovqXRegReg>(xbit.machine_reg(), gp);
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+    GenRaw<x86_64::MovqXRegReg>(xbit.machine_reg(), gp);
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
     FpRegister xshift = AllocTempSimdReg();
     FpRegister xsel = AllocTempSimdReg();
     for (int i = 0; i < 8; ++i) {
       // shifted_a = (a << i) per byte, byte-masked.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xshift.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xshift.machine_reg(), xa.machine_reg());
       if (i != 0) {
-        builder_.Gen<x86_64::PsllwXRegImm>(xshift.machine_reg(), static_cast<int8_t>(i));
+        GenRaw<x86_64::PsllwXRegImm>(xshift.machine_reg(), static_cast<int8_t>(i));
         // shift_mask = -bit per byte = (0xFF<<i)&0xFF.
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xzero.machine_reg());
-        builder_.Gen<x86_64::PsubbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xzero.machine_reg());
+        GenRaw<x86_64::PsubbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
       }
       // selector = (b & bit) PCMPEQB bit -> 0xFF per byte where bit i set.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xb.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
-      builder_.Gen<x86_64::PcmpeqbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xsel.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
+      GenRaw<x86_64::PcmpeqbXRegXReg>(xsel.machine_reg(), xbit.machine_reg());
       // acc ^= shifted_a & selector.
-      builder_.Gen<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xacc.machine_reg(), xshift.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xshift.machine_reg(), xsel.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xacc.machine_reg(), xshift.machine_reg());
       // Double bit for the next iteration (skip after the last bit).
       if (i != 7) {
-        builder_.Gen<x86_64::PaddbXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
+        GenRaw<x86_64::PaddbXRegXReg>(xbit.machine_reg(), xbit.machine_reg());
       }
     }
     SetVRegFull(args.rd, xacc, args.q);
@@ -6710,25 +6689,25 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
           // 0x80 in every byte (no PSLLB on x86): broadcast from a GPR.
           Register t = std::get<0>(
               Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
-          builder_.Gen<x86_64::MovqXRegReg>(sign.machine_reg(), t);
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(sign.machine_reg(), sign.machine_reg());
+          GenRaw<x86_64::MovqXRegReg>(sign.machine_reg(), t);
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(sign.machine_reg(), sign.machine_reg());
           break;
         }
         case 0b01:
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-          builder_.Gen<x86_64::PsllwXRegImm>(sign.machine_reg(), int8_t{15});
+          GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+          GenRaw<x86_64::PsllwXRegImm>(sign.machine_reg(), int8_t{15});
           break;
         case 0b10:
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-          builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
+          GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+          GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});
           break;
         default:  // 0b11
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-          builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
+          GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+          GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
           break;
       }
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
     }
     // CMHI (no invert): PCMPGT(xn, xm) -> result in xn.
     // CMGE/CMHS (invert): PCMPGT(xm, xn) -> result in xm, then invert.
@@ -6737,21 +6716,21 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister b = invert ? xn : xm;
     switch (args.size) {
       case 0b00:
-        builder_.Gen<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
+        GenRaw<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
       case 0b01:
-        builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
+        GenRaw<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
       case 0b10:
-        builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+        GenRaw<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
       default:  // 0b11
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
         break;
     }
     if (invert) {
       FpRegister ones = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
     }
     SetVRegFull(args.rd, res, args.q);
     return;
@@ -6791,58 +6770,58 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       FpRegister sign_mask = no_fp_register;
       if (is_max) {
         sign_mask = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PxorXRegXReg>(lo_n.machine_reg(), sign_mask.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(lo_m.machine_reg(), sign_mask.machine_reg());
+        GenRaw<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PxorXRegXReg>(lo_n.machine_reg(), sign_mask.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(lo_m.machine_reg(), sign_mask.machine_reg());
         if (args.q) {
-          builder_.Gen<x86_64::PxorXRegXReg>(hi_n.machine_reg(), sign_mask.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(hi_m.machine_reg(), sign_mask.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(hi_n.machine_reg(), sign_mask.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(hi_m.machine_reg(), sign_mask.machine_reg());
         }
       }
       // Always MIN now (FMAX reaches here with negated operands).
       auto minmax = [&](FpRegister d, FpRegister s) {
-        builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
+        GenRaw<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
       };
       // Returns the reg holding the (negated-for-max) min of the pair.
       auto do_half = [&](FpRegister a, FpRegister b) -> FpRegister {
         if (!is_nm) {
           // NaN-propagating: minab|minba|OR.
           FpRegister tmp = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
           minmax(tmp, a);      // min(b, a)
           minmax(a, b);        // min(a, b)
-          builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
+          GenRaw<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
           return a;
         }
         // NaN-suppressing: a' = select(isnan(a), b, a); b' = select(isnan(b), a, b),
         // then minab|minba|OR so the +-0 tie is order-independent (OR-of-signs).
         FpRegister ma = AllocTempSimdReg(), mb = AllocTempSimdReg();
         FpRegister as = AllocTempSimdReg(), bs = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(ma.machine_reg(), a.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(ma.machine_reg(), ma.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(mb.machine_reg(), b.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mb.machine_reg(), mb.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(as.machine_reg(), ma.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(as.machine_reg(), b.machine_reg());   // ma & b
-        builder_.Gen<x86_64::MovdqaXRegXReg>(bs.machine_reg(), mb.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(bs.machine_reg(), a.machine_reg());   // mb & a
-        builder_.Gen<x86_64::PandnXRegXReg>(ma.machine_reg(), a.machine_reg());  // ~ma & a
-        builder_.Gen<x86_64::PandnXRegXReg>(mb.machine_reg(), b.machine_reg());  // ~mb & b
-        builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), as.machine_reg());   // a'
-        builder_.Gen<x86_64::PorXRegXReg>(mb.machine_reg(), bs.machine_reg());   // b'
+        GenRaw<x86_64::MovdqaXRegXReg>(ma.machine_reg(), a.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(ma.machine_reg(), ma.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(mb.machine_reg(), b.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(mb.machine_reg(), mb.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(as.machine_reg(), ma.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(as.machine_reg(), b.machine_reg());  // ma & b
+        GenRaw<x86_64::MovdqaXRegXReg>(bs.machine_reg(), mb.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(bs.machine_reg(), a.machine_reg());   // mb & a
+        GenRaw<x86_64::PandnXRegXReg>(ma.machine_reg(), a.machine_reg());  // ~ma & a
+        GenRaw<x86_64::PandnXRegXReg>(mb.machine_reg(), b.machine_reg());  // ~mb & b
+        GenRaw<x86_64::PorXRegXReg>(ma.machine_reg(), as.machine_reg());   // a'
+        GenRaw<x86_64::PorXRegXReg>(mb.machine_reg(), bs.machine_reg());   // b'
         FpRegister t_nm = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mb.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mb.machine_reg());
         minmax(t_nm, ma);   // min(b', a')
         minmax(ma, mb);     // min(a', b')
-        builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), t_nm.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(ma.machine_reg(), t_nm.machine_reg());
         return ma;
       };
       FpRegister rlo = do_half(lo_n, lo_m);
       FpRegister rhi = args.q ? do_half(hi_n, hi_m) : no_fp_register;
       if (is_max) {
-        builder_.Gen<x86_64::PxorXRegXReg>(rlo.machine_reg(), sign_mask.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(rlo.machine_reg(), sign_mask.machine_reg());
         if (args.q) {
-          builder_.Gen<x86_64::PxorXRegXReg>(rhi.machine_reg(), sign_mask.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(rhi.machine_reg(), sign_mask.machine_reg());
         }
       }
       EmitNarrowHalfVecAndStore(args.rd, rlo, rhi, args.q);
@@ -6889,13 +6868,17 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       auto fp_op = [&](FpRegister d, FpRegister s) {
         switch (args.opcode) {
           case Decoder::AdvSimdThreeSameOpcode::kFaddV:
-            builder_.Gen<x86_64::AddpsXRegXReg>(d.machine_reg(), s.machine_reg()); break;
+            GenRaw<x86_64::AddpsXRegXReg>(d.machine_reg(), s.machine_reg());
+            break;
           case Decoder::AdvSimdThreeSameOpcode::kFsubV:
-            builder_.Gen<x86_64::SubpsXRegXReg>(d.machine_reg(), s.machine_reg()); break;
+            GenRaw<x86_64::SubpsXRegXReg>(d.machine_reg(), s.machine_reg());
+            break;
           case Decoder::AdvSimdThreeSameOpcode::kFmulV:
-            builder_.Gen<x86_64::MulpsXRegXReg>(d.machine_reg(), s.machine_reg()); break;
+            GenRaw<x86_64::MulpsXRegXReg>(d.machine_reg(), s.machine_reg());
+            break;
           default:  // kFdivV
-            builder_.Gen<x86_64::DivpsXRegXReg>(d.machine_reg(), s.machine_reg()); break;
+            GenRaw<x86_64::DivpsXRegXReg>(d.machine_reg(), s.machine_reg());
+            break;
         }
       };
       fp_op(lo_n, lo_m);
@@ -6911,31 +6894,31 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     if (is_double) {
       switch (args.opcode) {
         case Decoder::AdvSimdThreeSameOpcode::kFaddV:
-          builder_.Gen<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::AddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         case Decoder::AdvSimdThreeSameOpcode::kFsubV:
-          builder_.Gen<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         case Decoder::AdvSimdThreeSameOpcode::kFmulV:
-          builder_.Gen<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         default:  // kFdivV
-          builder_.Gen<x86_64::DivpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::DivpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
       }
     } else {
       switch (args.opcode) {
         case Decoder::AdvSimdThreeSameOpcode::kFaddV:
-          builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         case Decoder::AdvSimdThreeSameOpcode::kFsubV:
-          builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         case Decoder::AdvSimdThreeSameOpcode::kFmulV:
-          builder_.Gen<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
         default:  // kFdivV
-          builder_.Gen<x86_64::DivpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::DivpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
           break;
       }
     }
@@ -6976,12 +6959,12 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     if (args.size & 1) {
-      builder_.Gen<x86_64::HaddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::HaddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::HaddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::HaddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
       if (!args.q) {
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                static_cast<int8_t>(0x08));
+        GenRaw<x86_64::PshufdXRegXRegImm>(
+            xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x08));
       }
     }
     SetVRegFull(args.rd, xn, args.q);
@@ -7018,19 +7001,19 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       if (is_add) {
         // HADDPS(r, y) = [x0+x1, x2+x3, y0+y1, y2+y3].
         FpRegister r = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(r.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::HaddpsXRegXReg>(r.machine_reg(), y.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(r.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::HaddpsXRegXReg>(r.machine_reg(), y.machine_reg());
         return r;
       }
       // evens = [x0,x2,y0,y2] (SHUFPS 0x88); odds = [x1,x3,y1,y3] (SHUFPS 0xDD).
       FpRegister evens = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(evens.machine_reg(), x.machine_reg());
-      builder_.Gen<x86_64::ShufpsXRegXRegImm>(evens.machine_reg(), y.machine_reg(),
-                                              static_cast<int8_t>(0x88));
+      GenRaw<x86_64::MovdqaXRegXReg>(evens.machine_reg(), x.machine_reg());
+      GenRaw<x86_64::ShufpsXRegXRegImm>(
+          evens.machine_reg(), y.machine_reg(), static_cast<int8_t>(0x88));
       FpRegister odds = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(odds.machine_reg(), x.machine_reg());
-      builder_.Gen<x86_64::ShufpsXRegXRegImm>(odds.machine_reg(), y.machine_reg(),
-                                              static_cast<int8_t>(0xDD));
+      GenRaw<x86_64::MovdqaXRegXReg>(odds.machine_reg(), x.machine_reg());
+      GenRaw<x86_64::ShufpsXRegXRegImm>(
+          odds.machine_reg(), y.machine_reg(), static_cast<int8_t>(0xDD));
       return EmitFpPairwiseMinMaxF32Packed(evens, odds, is_max, is_nm);
     };
     FpRegister rlo, rhi;
@@ -7084,33 +7067,33 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         FpRegister xm_pd = AllocTempSimdReg();
         FpRegister xd_pd = AllocTempSimdReg();
         FpRegister xres = AllocTempSimdReg();
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
         if (is_fmls) {
-          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
               xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
         } else {
-          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfmadd231pdXRegXRegXReg>(
               xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
         }
-        builder_.Gen<x86_64::Cvtpd2psXRegXReg>(xres.machine_reg(), xd_pd.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::Cvtpd2psXRegXReg>(xres.machine_reg(), xd_pd.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xn_pd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xm_pd.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+        GenRaw<x86_64::Cvtps2pdXRegXReg>(xd_pd.machine_reg(), xd.machine_reg());
         if (is_fmls) {
-          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
               xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
         } else {
-          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfmadd231pdXRegXRegXReg>(
               xd_pd.machine_reg(), xn_pd.machine_reg(), xm_pd.machine_reg());
         }
-        builder_.Gen<x86_64::Cvtpd2psXRegXReg>(xn.machine_reg(), xd_pd.machine_reg());
-        builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::Cvtpd2psXRegXReg>(xn.machine_reg(), xd_pd.machine_reg());
+        GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PorXRegXReg>(xres.machine_reg(), xn.machine_reg());
         return xres;
       };
       FpRegister rlo = fma_quad(lo_n, lo_m, lo_d);
@@ -7130,18 +7113,18 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     if (is_fmls) {
       // Vd = Vd + (-Vn)*Vm -- single fused rounding.
       if (is_double) {
-        builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+        GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
             xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+        GenRaw<x86_64::Vfnmadd231psXRegXRegXReg>(
             xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
       }
     } else {
       if (is_double) {
-        builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+        GenRaw<x86_64::Vfmadd231pdXRegXRegXReg>(
             xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::Vfmadd231psXRegXRegXReg>(
+        GenRaw<x86_64::Vfmadd231psXRegXRegXReg>(
             xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
       }
     }
@@ -7190,32 +7173,32 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       FpRegister mask = no_fp_register;
       if (is_abs) {
         mask = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
+        GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
       }
       // Returns the reg holding the result mask for the pair (a=Vn-half, b=Vm-half).
       auto cmp = [&](FpRegister a, FpRegister b) -> FpRegister {
         if (is_abs) {
-          builder_.Gen<x86_64::PandXRegXReg>(a.machine_reg(), mask.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(b.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(a.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(b.machine_reg(), mask.machine_reg());
         }
         if (is_eq) {
-          builder_.Gen<x86_64::CmpeqpsXRegXReg>(a.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::CmpeqpsXRegXReg>(a.machine_reg(), b.machine_reg());
           return a;
         } else if (is_ge) {  // (b <= a) == (a >= b); mask lands in b
-          builder_.Gen<x86_64::CmplepsXRegXReg>(b.machine_reg(), a.machine_reg());
+          GenRaw<x86_64::CmplepsXRegXReg>(b.machine_reg(), a.machine_reg());
           return b;
         } else {  // FCMGT/FACGT: (b < a) == (a > b); mask lands in b
-          builder_.Gen<x86_64::CmpltpsXRegXReg>(b.machine_reg(), a.machine_reg());
+          GenRaw<x86_64::CmpltpsXRegXReg>(b.machine_reg(), a.machine_reg());
           return b;
         }
       };
       FpRegister rlo = cmp(lo_n, lo_m);
       if (args.q) {
         FpRegister rhi = cmp(hi_n, hi_m);
-        builder_.Gen<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rhi.machine_reg());
+        GenRaw<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rhi.machine_reg());
         SetVRegFull(args.rd, rlo, true);
       } else {
-        builder_.Gen<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rlo.machine_reg());
+        GenRaw<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rlo.machine_reg());
         SetVRegFull(args.rd, rlo, false);
       }
       return;
@@ -7234,35 +7217,35 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       // built with the ones>>1 idiom (see FABD). AllocOnesSimdReg is lifetime-safe.
       FpRegister mask = AllocOnesSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
       } else {
-        builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
       }
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xm.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xm.machine_reg(), mask.machine_reg());
     }
     FpRegister result;
     if (is_eq) {
       if (is_double) {
-        builder_.Gen<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
       result = xn;
     } else if (is_ge) {
       // (xm <= xn) == (xn >= xm); mask lands in xm.
       if (is_double) {
-        builder_.Gen<x86_64::CmplepdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::CmplepdXRegXReg>(xm.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmplepsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::CmplepsXRegXReg>(xm.machine_reg(), xn.machine_reg());
       }
       result = xm;
     } else {  // FCMGT / FACGT
       // (xm < xn) == (xn > xm); mask lands in xm.
       if (is_double) {
-        builder_.Gen<x86_64::CmpltpdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::CmpltpdXRegXReg>(xm.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmpltpsXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::CmpltpsXRegXReg>(xm.machine_reg(), xn.machine_reg());
       }
       result = xm;
     }
@@ -7326,35 +7309,35 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     // sign-extended to dwords).
     auto shift_dwords = [&](FpRegister xv, FpRegister xcount) {
       FpRegister xisneg = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xcount.machine_reg());
+      GenRaw<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xcount.machine_reg());
 
       FpRegister xleft = AllocTempSimdReg();
-      builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
+      GenRaw<x86_64::VpsllvdXRegXRegXReg>(
           xleft.machine_reg(), xv.machine_reg(), xcount.machine_reg());
 
       FpRegister xs = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xcount.machine_reg());
+      GenRaw<x86_64::PsubdXRegXReg>(xs.machine_reg(), xcount.machine_reg());
       FpRegister xright = AllocTempSimdReg();
       if (is_signed) {
-        builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+        GenRaw<x86_64::VpsravdXRegXRegXReg>(
             xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       } else {
-        builder_.Gen<x86_64::VpsrlvdXRegXRegXReg>(
+        GenRaw<x86_64::VpsrlvdXRegXRegXReg>(
             xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       }
 
       FpRegister xres = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
       return xres;
     };
 
     if (args.size == 0b10) {
       // shift = sext8(Vm.lane[7:0]) per dword.
-      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
-      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      GenRaw<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+      GenRaw<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
       SetVRegFull(args.rd, shift_dwords(xa, xsh), args.q);
       return;
     }
@@ -7362,31 +7345,31 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     if (args.size == 0b01) {
       // Low halfwords: value extended from bits [15:0], count sext8 of bits [7:0].
       FpRegister xlo = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xlo.machine_reg(), xa.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(xlo.machine_reg(), int8_t{16});
+      GenRaw<x86_64::MovdqaXRegXReg>(xlo.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(xlo.machine_reg(), int8_t{16});
       FpRegister xclo = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xclo.machine_reg(), xsh.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(xclo.machine_reg(), int8_t{24});
-      builder_.Gen<x86_64::PsradXRegImm>(xclo.machine_reg(), int8_t{24});
+      GenRaw<x86_64::MovdqaXRegXReg>(xclo.machine_reg(), xsh.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(xclo.machine_reg(), int8_t{24});
+      GenRaw<x86_64::PsradXRegImm>(xclo.machine_reg(), int8_t{24});
       // High halfwords: value extended from bits [31:16], count sext8 of bits [23:16].
       FpRegister xhi = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xa.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      GenRaw<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
       if (is_signed) {
-        builder_.Gen<x86_64::PsradXRegImm>(xlo.machine_reg(), int8_t{16});
-        builder_.Gen<x86_64::PsradXRegImm>(xhi.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsradXRegImm>(xlo.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsradXRegImm>(xhi.machine_reg(), int8_t{16});
       } else {
-        builder_.Gen<x86_64::PsrldXRegImm>(xlo.machine_reg(), int8_t{16});
-        builder_.Gen<x86_64::PsrldXRegImm>(xhi.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsrldXRegImm>(xlo.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PsrldXRegImm>(xhi.machine_reg(), int8_t{16});
       }
       FpRegister xrlo = shift_dwords(xlo, xclo);
       FpRegister xrhi = shift_dwords(xhi, xsh);
       // Merge: low 16 bits of each dword result into their halfword slots.
-      builder_.Gen<x86_64::PslldXRegImm>(xrlo.machine_reg(), int8_t{16});
-      builder_.Gen<x86_64::PsrldXRegImm>(xrlo.machine_reg(), int8_t{16});
-      builder_.Gen<x86_64::PslldXRegImm>(xrhi.machine_reg(), int8_t{16});
-      builder_.Gen<x86_64::PorXRegXReg>(xrlo.machine_reg(), xrhi.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PsrldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PslldXRegImm>(xrhi.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PorXRegXReg>(xrlo.machine_reg(), xrhi.machine_reg());
       SetVRegFull(args.rd, xrlo, args.q);
       return;
     }
@@ -7394,49 +7377,47 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     // 64-bit lanes. shift = sext8(lane & 0xFF) = ((lane & 0xFF) ^ 0x80) - 0x80.
     Register gp80 = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x80}));
     FpRegister x80 = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovqXRegReg>(x80.machine_reg(), gp80);
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(x80.machine_reg(), x80.machine_reg());
+    GenRaw<x86_64::MovqXRegReg>(x80.machine_reg(), gp80);
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(x80.machine_reg(), x80.machine_reg());
     Register gpff = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0xFF}));
     FpRegister xff = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovqXRegReg>(xff.machine_reg(), gpff);
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xff.machine_reg(), xff.machine_reg());
+    GenRaw<x86_64::MovqXRegReg>(xff.machine_reg(), gpff);
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(xff.machine_reg(), xff.machine_reg());
 
-    builder_.Gen<x86_64::PandXRegXReg>(xsh.machine_reg(), xff.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xsh.machine_reg(), x80.machine_reg());
-    builder_.Gen<x86_64::PsubqXRegXReg>(xsh.machine_reg(), x80.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xsh.machine_reg(), xff.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xsh.machine_reg(), x80.machine_reg());
+    GenRaw<x86_64::PsubqXRegXReg>(xsh.machine_reg(), x80.machine_reg());
 
     FpRegister xisneg = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::PcmpgtqXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
 
     FpRegister xleft = AllocTempSimdReg();
-    builder_.Gen<x86_64::VpsllvqXRegXRegXReg>(
-        xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::VpsllvqXRegXRegXReg>(xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
 
     FpRegister xs = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PsubqXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::PsubqXRegXReg>(xs.machine_reg(), xsh.machine_reg());
 
     FpRegister xright = AllocTempSimdReg();
     if (is_signed) {
       // sar via sign-smear XOR: m = (a < 0) ? ~0 : 0.
       FpRegister xm = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xa.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xright.machine_reg(), xa.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xright.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xright.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xright.machine_reg(), xm.machine_reg());
       FpRegister xshifted = AllocTempSimdReg();
-      builder_.Gen<x86_64::VpsrlvqXRegXRegXReg>(
+      GenRaw<x86_64::VpsrlvqXRegXRegXReg>(
           xshifted.machine_reg(), xright.machine_reg(), xs.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xshifted.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xshifted.machine_reg(), xm.machine_reg());
       xright = xshifted;
     } else {
-      builder_.Gen<x86_64::VpsrlvqXRegXRegXReg>(
-          xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+      GenRaw<x86_64::VpsrlvqXRegXRegXReg>(xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
     }
 
     FpRegister xres = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
     SetVRegFull(args.rd, xres, /*q=*/true);
     return;
   }
@@ -7480,70 +7461,67 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
 
     // shift = sign-extend(Vm.lane[7:0]) — the ARM shift amount is the low byte
     // of the lane, not the whole lane.
-    builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
-    builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+    GenRaw<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+    GenRaw<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
 
     // is_neg = shift < 0, i.e. 0 > shift.
     FpRegister xisneg = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
 
     // Left arm: a << shift. Lanes where shift < 0 get a huge unsigned count and
     // are zeroed by VPSLLVD; they are discarded by the select below.
     FpRegister xleft = AllocTempSimdReg();
-    builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
-        xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::VpsllvdXRegXRegXReg>(xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
 
     if (is_saturating) {
       // Overflow iff shifting back does not reproduce the input. This also
       // covers shift >= 32: VPSLLVD zeroed the lane, so the back-shift differs
       // from any non-zero input, and a zero input correctly stays zero.
       FpRegister xback = AllocTempSimdReg();
-      builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
+      GenRaw<x86_64::VpsravdXRegXRegXReg>(
           xback.machine_reg(), xleft.machine_reg(), xsh.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xback.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xback.machine_reg(), xa.machine_reg());
       // xback is now "no overflow" (all-ones where the round trip matched).
 
       // saturated = (a >> 31) ^ INT32_MAX: 0 ^ MAX == INT32_MAX for a >= 0,
       // -1 ^ MAX == INT32_MIN for a < 0.
       FpRegister xsat = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xsat.machine_reg(), xa.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(xsat.machine_reg(), int8_t{31});
+      GenRaw<x86_64::MovdqaXRegXReg>(xsat.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(xsat.machine_reg(), int8_t{31});
       FpRegister xmax = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(xmax.machine_reg(), int8_t{1});  // 0x7FFFFFFF
-      builder_.Gen<x86_64::PxorXRegXReg>(xsat.machine_reg(), xmax.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xmax.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+      GenRaw<x86_64::PxorXRegXReg>(xsat.machine_reg(), xmax.machine_reg());
 
       // left = no_overflow ? left : saturated.
       FpRegister xkeep = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xkeep.machine_reg(), xleft.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xback.machine_reg(), xsat.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xkeep.machine_reg(), xleft.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xback.machine_reg(), xsat.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xkeep.machine_reg(), xback.machine_reg());
       xleft = xkeep;
     }
 
     // Right arm: s = -shift, then (a >> s) + ((a >> (s-1)) & 1).
     FpRegister xs = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+    GenRaw<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
     FpRegister xsm1 = AllocOnesSimdReg();  // all-ones == -1 per lane
-    builder_.Gen<x86_64::PadddXRegXReg>(xsm1.machine_reg(), xs.machine_reg());
+    GenRaw<x86_64::PadddXRegXReg>(xsm1.machine_reg(), xs.machine_reg());
 
     FpRegister xhi = AllocTempSimdReg();
-    builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
-        xhi.machine_reg(), xa.machine_reg(), xs.machine_reg());
+    GenRaw<x86_64::VpsravdXRegXRegXReg>(xhi.machine_reg(), xa.machine_reg(), xs.machine_reg());
     FpRegister xrb = AllocTempSimdReg();
-    builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
-        xrb.machine_reg(), xa.machine_reg(), xsm1.machine_reg());
+    GenRaw<x86_64::VpsravdXRegXRegXReg>(xrb.machine_reg(), xa.machine_reg(), xsm1.machine_reg());
     FpRegister xone = AllocOnesSimdReg();
-    builder_.Gen<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
-    builder_.Gen<x86_64::PandXRegXReg>(xrb.machine_reg(), xone.machine_reg());
-    builder_.Gen<x86_64::PadddXRegXReg>(xhi.machine_reg(), xrb.machine_reg());
+    GenRaw<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
+    GenRaw<x86_64::PandXRegXReg>(xrb.machine_reg(), xone.machine_reg());
+    GenRaw<x86_64::PadddXRegXReg>(xhi.machine_reg(), xrb.machine_reg());
 
     // result = is_neg ? right : left.
     FpRegister xres = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xhi.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xhi.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
 
     // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
     SetVRegFull(args.rd, xres, args.q);
@@ -7592,14 +7570,12 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     auto broadcast = [&](int64_t bits_d, int32_t bits_s) -> FpRegister {
       FpRegister x = AllocTempSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(),
-                                          GetImm(static_cast<uint64_t>(bits_d)));
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(x.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(x.machine_reg(), GetImm(static_cast<uint64_t>(bits_d)));
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(x.machine_reg(), x.machine_reg());
       } else {
-        builder_.Gen<x86_64::MovdXRegReg>(
-            x.machine_reg(), GetImm(static_cast<uint64_t>(static_cast<uint32_t>(bits_s))));
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
-            x.machine_reg(), x.machine_reg(), int8_t{0});
+        GenRaw<x86_64::MovdXRegReg>(x.machine_reg(),
+                                    GetImm(static_cast<uint64_t>(static_cast<uint32_t>(bits_s))));
+        GenRaw<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(), int8_t{0});
       }
       return x;
     };
@@ -7611,38 +7587,38 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
 
     // input_unord = cmpunord(a, b): all-ones per lane iff either input is NaN.
     FpRegister xiu = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xiu.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xiu.machine_reg(), xn.machine_reg());
     if (is_double) {
-      builder_.Gen<x86_64::CmpunordpdXRegXReg>(xiu.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::CmpunordpdXRegXReg>(xiu.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(xiu.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(xiu.machine_reg(), xm.machine_reg());
     }
 
     // mul_unord = cmpunord(a*b, a*b). Only the NaN-ness of the product is
     // observed, never its value, so the product register is reused in place.
     FpRegister xmul = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmul.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmul.machine_reg(), xn.machine_reg());
     if (is_double) {
-      builder_.Gen<x86_64::MulpdXRegXReg>(xmul.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::CmpunordpdXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
+      GenRaw<x86_64::MulpdXRegXReg>(xmul.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::CmpunordpdXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
     } else {
-      builder_.Gen<x86_64::MulpsXRegXReg>(xmul.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
+      GenRaw<x86_64::MulpsXRegXReg>(xmul.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(xmul.machine_reg(), xmul.machine_reg());
     }
 
     // special = (NOT input_unord) AND mul_unord — the 0*inf lanes. PANDN writes
     // (NOT dst) AND src, so input_unord stays live in xiu for the second select.
     FpRegister xspecial = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xspecial.machine_reg(), xiu.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xmul.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xspecial.machine_reg(), xiu.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xmul.machine_reg());
 
     // Normal path: K_fma - a*b in one rounding via VFNMADD231 (dst -= n*m).
     FpRegister xres = broadcast(k_fma_bits_d, k_fma_bits_s);
     if (is_double) {
-      builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
           xres.machine_reg(), xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+      GenRaw<x86_64::Vfnmadd231psXRegXRegXReg>(
           xres.machine_reg(), xn.machine_reg(), xm.machine_reg());
     }
 
@@ -7651,23 +7627,23 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     if (!is_frecps) {
       FpRegister xtwo = broadcast(kTwoBitsD, kTwoBitsS);
       if (is_double) {
-        builder_.Gen<x86_64::DivpdXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
+        GenRaw<x86_64::DivpdXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
       } else {
-        builder_.Gen<x86_64::DivpsXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
+        GenRaw<x86_64::DivpsXRegXReg>(xres.machine_reg(), xtwo.machine_reg());
       }
     }
 
     // select 1: special ? K_sat : fma_result.
     FpRegister xsat = broadcast(k_sat_bits_d, k_sat_bits_s);
-    builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xres.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xspecial.machine_reg(), xres.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xsat.machine_reg(), xspecial.machine_reg());
 
     // select 2: input_unord ? qNaN : previous.
     FpRegister xqnan = broadcast(kQnanBitsD, kQnanBitsS);
-    builder_.Gen<x86_64::PandXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xiu.machine_reg(), xsat.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xiu.machine_reg(), xsat.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xqnan.machine_reg(), xiu.machine_reg());
 
     // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
     SetVRegFull(args.rd, xqnan, args.q);
@@ -7688,12 +7664,12 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       EmitWidenHalfVec(vn_off, args.q, &lo_n, &hi_n);
       EmitWidenHalfVec(vm_off, args.q, &lo_m, &hi_m);
       FpRegister mask = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
-      builder_.Gen<x86_64::SubpsXRegXReg>(lo_n.machine_reg(), lo_m.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(lo_n.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
+      GenRaw<x86_64::SubpsXRegXReg>(lo_n.machine_reg(), lo_m.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(lo_n.machine_reg(), mask.machine_reg());
       if (args.q) {
-        builder_.Gen<x86_64::SubpsXRegXReg>(hi_n.machine_reg(), hi_m.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(hi_n.machine_reg(), mask.machine_reg());
+        GenRaw<x86_64::SubpsXRegXReg>(hi_n.machine_reg(), hi_m.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(hi_n.machine_reg(), mask.machine_reg());
       }
       EmitNarrowHalfVecAndStore(args.rd, lo_n, hi_n, args.q);
       return;
@@ -7704,17 +7680,17 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     if (is_double) {
-      builder_.Gen<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::SubpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::SubpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
     }
     FpRegister mask = AllocOnesSimdReg();
     if (is_double) {
-      builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
+      GenRaw<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
     } else {
-      builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
+      GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
     }
-    builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
     // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
     SetVRegFull(args.rd, xn, args.q);
     return;
@@ -7740,23 +7716,23 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     FpRegister xn_hi = AllocTempSimdReg();
     FpRegister xm_hi = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
-    builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-    builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
-    builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PmullwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+    GenRaw<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+    GenRaw<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PmullwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
     // Reuse xm (already defined) as the 0x00FF x8 mask so PACKUSWB does not
     // saturate on the high byte of each 16-bit product lane.
-    builder_.Gen<x86_64::PcmpeqbXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
-    builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});            // 0x00FF x8
-    builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+    GenRaw<x86_64::PcmpeqbXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+    GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});            // 0x00FF x8
+    GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
     if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMul) {
       // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xn, args.q);
@@ -7766,9 +7742,9 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
     if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kMls) {
-      builder_.Gen<x86_64::PsubbXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsubbXRegXReg>(xd.machine_reg(), xn.machine_reg());
     } else {
-      builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
     }
     SetVRegFull(args.rd, xd, args.q);
     return;
@@ -7802,22 +7778,22 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
     // Low-half product Vn*Vm into xn.
     if (args.size == 0b01) {
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
     }
     // Accumulate into / subtract from Vd at the element width.
     if (is_mls) {
       if (args.size == 0b01) {
-        builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
     } else {
       if (args.size == 0b01) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
     }
     // Q=0 (.4H/.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
@@ -7846,17 +7822,17 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
     FpRegister res = xn;  // BSL/BIT accumulate into xn; BIF stores xd.
     if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBsl) {
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn^Vm
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xd.machine_reg());  // &Vd
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // ^Vm
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn^Vm
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xd.machine_reg());  // &Vd
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // ^Vm
     } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kBit) {
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // Vn^Vd
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // &Vm
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // ^Vd
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // Vn^Vd
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // &Vm
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());  // ^Vd
     } else {  // kBif: fold the NOT into PANDN (~xm & xn).
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());   // Vn^Vd
-      builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());  // ~Vm & (Vn^Vd)
-      builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xm.machine_reg());   // Vd ^ ...
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xd.machine_reg());   // Vn^Vd
+      GenRaw<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());  // ~Vm & (Vn^Vd)
+      GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(), xm.machine_reg());   // Vd ^ ...
       res = xd;
     }
     // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
@@ -7889,9 +7865,9 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqadd) {
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
         // 32-bit signed saturating add. sum = a + b (wrap); overflow iff
         // ~(a^b) & (a^sum) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
@@ -7899,47 +7875,47 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         FpRegister t_sum = AllocTempSimdReg();
         FpRegister t_ovf = AllocTempSimdReg();
         FpRegister t_sat = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // ~(a^b)
-        builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // ~(a^b)
+        GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});        // a<0?-1:0
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});         // 0x7FFFFFFF
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sat
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
       }
     } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kUqadd) {
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
         // 32-bit unsigned saturating add. sum = a + b (wrap); overflow iff
         // sum < a (unsigned), detected via PMAXUD: max(a,sum)==sum iff no
         // overflow; saturate overflowed lanes to UINT32_MAX.
         FpRegister t_save_a = AllocTempSimdReg();
         FpRegister t_ones = AllocZeroedSimdReg();  // def before the self-compare
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());       // sum
-        builder_.Gen<x86_64::PmaxudXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());  // -1 if no ovf
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_ones.machine_reg(), t_ones.machine_reg());  // -1
-        builder_.Gen<x86_64::PxorXRegXReg>(t_save_a.machine_reg(), t_ones.machine_reg());   // -1 if ovf
-        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), t_save_a.machine_reg());        // saturate
+        GenRaw<x86_64::MovdqaXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sum
+        GenRaw<x86_64::PmaxudXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(t_save_a.machine_reg(), xn.machine_reg());  // -1 if no ovf
+        GenRaw<x86_64::PcmpeqdXRegXReg>(t_ones.machine_reg(), t_ones.machine_reg());  // -1
+        GenRaw<x86_64::PxorXRegXReg>(t_save_a.machine_reg(), t_ones.machine_reg());   // -1 if ovf
+        GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), t_save_a.machine_reg());        // saturate
       }
     } else if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqsub) {
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
         // 32-bit signed saturating sub. diff = a - b (wrap); overflow iff
         // (a^b) & (a^diff) has its MSB set; sat = (a<0)?INT_MIN:INT_MAX;
@@ -7947,36 +7923,36 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         FpRegister t_diff = AllocTempSimdReg();
         FpRegister t_ovf = AllocTempSimdReg();
         FpRegister t_sat = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // a^b
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
-        builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // a<0?-1:0
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());   // -1
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // a^b
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
+        GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});           // a<0?-1:0
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});            // 0x7FFFFFFF
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());     // sat
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
       }
     } else {  // kUqsub
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
         // 32-bit unsigned saturating sub. result = (a>=b) ? a-b : 0. Mask:
         // PMINUD(a,b)==b iff a>=b; AND the wrap-diff with it to zero underflow.
         FpRegister t_mask = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 if a>=b
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());        // a-b
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());     // zero underflow
+        GenRaw<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 if a>=b
+        GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());        // a-b
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());     // zero underflow
       }
     }
     // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
@@ -8045,29 +8021,41 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     switch (args.size) {
       case 0b00:  // .16B / .8B
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       case 0b01:  // .8H / .4H
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       default:  // 0b10: .4S / .2S
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
     }
@@ -8114,37 +8102,37 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     // xmax = max(Vn, Vm); xn = min(Vn, Vm); xmax -= xn == |Vn - Vm|.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
     switch (args.size) {
       case 0b00:  // .16B / .8B
         if (is_signed) {
-          builder_.Gen<x86_64::PmaxsbXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxsbXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmaxubXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxubXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
-        builder_.Gen<x86_64::PsubbXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubbXRegXReg>(xmax.machine_reg(), xn.machine_reg());
         break;
       case 0b01:  // .8H / .4H
         if (is_signed) {
-          builder_.Gen<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
-        builder_.Gen<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
         break;
       default:  // 0b10: .4S / .2S
         if (is_signed) {
-          builder_.Gen<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
-        builder_.Gen<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
         break;
     }
     if (is_accum) {
@@ -8155,13 +8143,13 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+          GenRaw<x86_64::PaddbXRegXReg>(xd.machine_reg(), xmax.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+          GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
           break;
         default:  // 0b10
-          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+          GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
           break;
       }
       // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
@@ -8223,32 +8211,40 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       FpRegister xtmp = AllocTempSimdReg();  // (a&b) for floor, (a^b) is in xn
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
       if (is_round) {
         // (a|b) - ((a^b)>>1): xtmp = a|b, xn = (a^b)>>1, xtmp -= xn.
-        builder_.Gen<x86_64::PorXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
         if (args.size == 0b01) {
-          if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
-          else builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
-          builder_.Gen<x86_64::PsubwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          if (is_signed)
+            GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+          else
+            GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsubwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
         } else {  // size == 0b10
-          if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
-          else builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
-          builder_.Gen<x86_64::PsubdXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          if (is_signed)
+            GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+          else
+            GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsubdXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
         }
       } else {
         // (a&b) + ((a^b)>>1): xtmp = a&b, xn = (a^b)>>1, xtmp += xn.
-        builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xtmp.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
         if (args.size == 0b01) {
-          if (is_signed) builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
-          else builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
-          builder_.Gen<x86_64::PaddwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          if (is_signed)
+            GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+          else
+            GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PaddwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
         } else {  // size == 0b10
-          if (is_signed) builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
-          else builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
-          builder_.Gen<x86_64::PadddXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+          if (is_signed)
+            GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+          else
+            GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PadddXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
         }
       }
       SetVRegFull(args.rd, xtmp, args.q);
@@ -8262,53 +8258,53 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xm_hi = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PsrldqXRegImm>(xm_hi.machine_reg(), int8_t{8});
 
     if (args.size == 0b00) {
       // 8->16 widen.
       if (is_signed) {
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
       }
       if (is_sub) {
-        builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
         if (is_round) {
           // +1 per word: xm/xm_hi are dead; clobber to all-ones and PSUBW.
-          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PsubwXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
         }
       }
       if (is_signed) {
-        builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{1});
         if (is_sub) {
           // Mask low byte per word so PACKUSWB does not saturate the modular
           // a<b result (in [0x7F80, 0x7FFF]) up to 0xFF.
-          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
-          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
         }
-        builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
       }
       SetVRegFull(args.rd, xn, args.q);
       return;
@@ -8317,30 +8313,30 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     // SUB size=01 (halfword): 16->32 widen, PSUBD, shift, PACKSSDW/PACKUSDW.
     if (args.size == 0b01) {
       if (is_signed) {
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PsradXRegImm>(xn_hi.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsradXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
-        builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
-        builder_.Gen<x86_64::PsrldXRegImm>(xn_hi.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+        GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+        GenRaw<x86_64::PsrldXRegImm>(xn_hi.machine_reg(), int8_t{1});
         // Mask low 16 bits per dword before PACKUSDW.
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
       }
       SetVRegFull(args.rd, xn, args.q);
       return;
@@ -8351,25 +8347,25 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     // an arithmetic shift is discarded by the low-dword gather, so PMOVSXDQ vs
     // PMOVZXDQ alone distinguishes signed/unsigned.
     if (is_signed) {
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
     } else {
-      builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-      builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
+      GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmovzxdqXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+      GenRaw<x86_64::PmovzxdqXRegXReg>(xm_hi.machine_reg(), xm_hi.machine_reg());
     }
-    builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PsubqXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
-    builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{1});
-    builder_.Gen<x86_64::PsrlqXRegImm>(xn_hi.machine_reg(), int8_t{1});
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                            static_cast<int8_t>(0x88));
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xn_hi.machine_reg(), xn_hi.machine_reg(),
-                                            static_cast<int8_t>(0x88));
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+    GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PsubqXRegXReg>(xn_hi.machine_reg(), xm_hi.machine_reg());
+    GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{1});
+    GenRaw<x86_64::PsrlqXRegImm>(xn_hi.machine_reg(), int8_t{1});
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x88));
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        xn_hi.machine_reg(), xn_hi.machine_reg(), static_cast<int8_t>(0x88));
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
     SetVRegFull(args.rd, xn, args.q);
     return;
   }
@@ -8400,48 +8396,46 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       case 0b00: {
         FpRegister tmp_n = AllocTempSimdReg();
         FpRegister tmp_m = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp_n.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp_m.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsrlwXRegImm>(tmp_n.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrlwXRegImm>(tmp_m.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PaddbXRegXReg>(xn.machine_reg(), tmp_n.machine_reg());
-        builder_.Gen<x86_64::PaddbXRegXReg>(xm.machine_reg(), tmp_m.machine_reg());
-        builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+        GenRaw<x86_64::MovdqaXRegXReg>(tmp_n.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(tmp_m.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsrlwXRegImm>(tmp_n.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrlwXRegImm>(tmp_m.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PaddbXRegXReg>(xn.machine_reg(), tmp_n.machine_reg());
+        GenRaw<x86_64::PaddbXRegXReg>(xm.machine_reg(), tmp_m.machine_reg());
+        GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
         if (args.q) {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xm.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       }
       case 0b01:
-        builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         if (!args.q) {
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                  int8_t{0x08});
+          GenRaw<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x08});
         }
         break;
       case 0b10:
-        builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
         if (!args.q) {
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                  int8_t{0x08});
+          GenRaw<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x08});
         }
         break;
       case 0b11: {  // .2D (Q=1); .1D already bailed above.
         FpRegister tmp = AllocTempSimdReg();
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(tmp.machine_reg(), xn.machine_reg(),
-                                                static_cast<int8_t>(0xEE));
-        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), tmp.machine_reg());
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(tmp.machine_reg(), xm.machine_reg(),
-                                                static_cast<int8_t>(0xEE));
-        builder_.Gen<x86_64::PaddqXRegXReg>(xm.machine_reg(), tmp.machine_reg());
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PshufdXRegXRegImm>(
+            tmp.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xEE));
+        GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), tmp.machine_reg());
+        GenRaw<x86_64::PshufdXRegXRegImm>(
+            tmp.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xEE));
+        GenRaw<x86_64::PaddqXRegXReg>(xm.machine_reg(), tmp.machine_reg());
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       }
     }
@@ -8494,29 +8488,41 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       switch (args.size) {
         case 0b00:
           if (is_signed) {
-            if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminsbXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxsbXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminsbXRegXReg>(dst.machine_reg(), src.machine_reg());
           } else {
-            if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminubXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxubXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminubXRegXReg>(dst.machine_reg(), src.machine_reg());
           }
           break;
         case 0b01:
           if (is_signed) {
-            if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminswXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxswXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminswXRegXReg>(dst.machine_reg(), src.machine_reg());
           } else {
-            if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminuwXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxuwXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminuwXRegXReg>(dst.machine_reg(), src.machine_reg());
           }
           break;
         case 0b10:
           if (is_signed) {
-            if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminsdXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxsdXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminsdXRegXReg>(dst.machine_reg(), src.machine_reg());
           } else {
-            if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(dst.machine_reg(), src.machine_reg());
-            else builder_.Gen<x86_64::PminudXRegXReg>(dst.machine_reg(), src.machine_reg());
+            if (is_max)
+              GenRaw<x86_64::PmaxudXRegXReg>(dst.machine_reg(), src.machine_reg());
+            else
+              GenRaw<x86_64::PminudXRegXReg>(dst.machine_reg(), src.machine_reg());
           }
           break;
       }
@@ -8545,30 +8551,30 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
         odd_hi = static_cast<int64_t>(0x8080808080808080ULL);
       }
       Register elo = std::get<0>(Gen<x86_64::MovqRegImm>(even_lo));
-      builder_.Gen<x86_64::MovqXRegReg>(even_mask.machine_reg(), elo);
+      GenRaw<x86_64::MovqXRegReg>(even_mask.machine_reg(), elo);
       Register ehi = std::get<0>(Gen<x86_64::MovqRegImm>(even_hi));
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(even_mask.machine_reg(), ehi, int8_t{1});
+      GenRaw<x86_64::PinsrqXRegRegImm>(even_mask.machine_reg(), ehi, int8_t{1});
       Register olo = std::get<0>(Gen<x86_64::MovqRegImm>(odd_lo));
-      builder_.Gen<x86_64::MovqXRegReg>(odd_mask.machine_reg(), olo);
+      GenRaw<x86_64::MovqXRegReg>(odd_mask.machine_reg(), olo);
       Register ohi = std::get<0>(Gen<x86_64::MovqRegImm>(odd_hi));
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(odd_mask.machine_reg(), ohi, int8_t{1});
+      GenRaw<x86_64::PinsrqXRegRegImm>(odd_mask.machine_reg(), ohi, int8_t{1});
 
-      builder_.Gen<x86_64::MovdqaXRegXReg>(evens_n.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(evens_n.machine_reg(), even_mask.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(odds_n.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(odds_n.machine_reg(), odd_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(evens_n.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(evens_n.machine_reg(), even_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(odds_n.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(odds_n.machine_reg(), odd_mask.machine_reg());
       pmax_pmin(evens_n, odds_n);  // low 8 bytes hold pair(Vn)
 
-      builder_.Gen<x86_64::MovdqaXRegXReg>(evens_m.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(evens_m.machine_reg(), even_mask.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(odds_m.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(odds_m.machine_reg(), odd_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(evens_m.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(evens_m.machine_reg(), even_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(odds_m.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(odds_m.machine_reg(), odd_mask.machine_reg());
       pmax_pmin(evens_m, odds_m);  // low 8 bytes hold pair(Vm)
 
       if (args.q) {
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
       } else {
-        builder_.Gen<x86_64::PunpckldqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+        GenRaw<x86_64::PunpckldqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
       }
       SetVRegFull(args.rd, evens_n, args.q);
       return;
@@ -8581,20 +8587,19 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister odds_n = AllocTempSimdReg();
     FpRegister evens_m = AllocTempSimdReg();
     FpRegister odds_m = AllocTempSimdReg();
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_n.machine_reg(), xn.machine_reg(),
-                                            static_cast<int8_t>(0x88));
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(odds_n.machine_reg(), xn.machine_reg(),
-                                            static_cast<int8_t>(0xDD));
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        evens_n.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x88));
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        odds_n.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xDD));
     pmax_pmin(evens_n, odds_n);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_m.machine_reg(), xm.machine_reg(),
-                                            static_cast<int8_t>(0x88));
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(odds_m.machine_reg(), xm.machine_reg(),
-                                            static_cast<int8_t>(0xDD));
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        evens_m.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0x88));
+    GenRaw<x86_64::PshufdXRegXRegImm>(
+        odds_m.machine_reg(), xm.machine_reg(), static_cast<int8_t>(0xDD));
     pmax_pmin(evens_m, odds_m);
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(evens_n.machine_reg(), evens_m.machine_reg());
     if (!args.q) {
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(evens_n.machine_reg(), evens_n.machine_reg(),
-                                              int8_t{0x08});
+      GenRaw<x86_64::PshufdXRegXRegImm>(evens_n.machine_reg(), evens_n.machine_reg(), int8_t{0x08});
     }
     SetVRegFull(args.rd, evens_n, args.q);
     return;
@@ -8637,29 +8642,41 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     switch (args.size) {
       case 0b00:  // .16B / .8B
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminubXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       case 0b01:  // .8H / .4H
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       case 0b10:  // .4S / .2S
         if (is_signed) {
-          if (is_max) builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          if (is_max) builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          else builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          if (is_max)
+            GenRaw<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          else
+            GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
     }
@@ -8678,7 +8695,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xm = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xm.machine_reg(), xn.machine_reg());
     SetVRegFull(args.rd, xm, args.q);
     return;
   }
@@ -8691,9 +8708,9 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister ones = AllocZeroedSimdReg();  // def before the self-compare
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
     SetVRegFull(args.rd, xn, args.q);
     return;
   }
@@ -8712,18 +8729,26 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xm = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn & Vm
+    GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());  // Vn & Vm
     FpRegister z = AllocZeroedSimdReg();  // zero, proper def for the self-compare below
     switch (args.size) {
-      case 0b00: builder_.Gen<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
-      case 0b01: builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
-      case 0b10: builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
-      default:   builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), z.machine_reg()); break;
+      case 0b00:
+        GenRaw<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), z.machine_reg());
+        break;
+      case 0b01:
+        GenRaw<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), z.machine_reg());
+        break;
+      case 0b10:
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), z.machine_reg());
+        break;
+      default:
+        GenRaw<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), z.machine_reg());
+        break;
     }
     // z is now dead as the zero comparand; clobber it to all-ones (it already
     // has a def, so the self-PCMPEQD is legal) and XOR to invert the mask.
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(z.machine_reg(), z.machine_reg());  // z = -1
-    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), z.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(z.machine_reg(), z.machine_reg());  // z = -1
+    GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), z.machine_reg());
     SetVRegFull(args.rd, xn, args.q);
     return;
   }
@@ -8777,62 +8802,62 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   switch (args.opcode) {
     case Decoder::AdvSimdThreeSameOpcode::kAdd:
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PaddbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PaddbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b10) {
-        builder_.Gen<x86_64::PadddXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddqXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     case Decoder::AdvSimdThreeSameOpcode::kSub:
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PsubbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PsubbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PsubwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b10) {
-        builder_.Gen<x86_64::PsubdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubqXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PsubqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     case Decoder::AdvSimdThreeSameOpcode::kMul:
       if (args.size == 0b01) {
-        builder_.Gen<x86_64::PmullwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PmullwXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmulldXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PmulldXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     case Decoder::AdvSimdThreeSameOpcode::kAnd:
-      builder_.Gen<x86_64::PandXRegXReg>(vn.machine_reg(), vm.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(vn.machine_reg(), vm.machine_reg());
       break;
     case Decoder::AdvSimdThreeSameOpcode::kOrr:
-      builder_.Gen<x86_64::PorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(vn.machine_reg(), vm.machine_reg());
       break;
     case Decoder::AdvSimdThreeSameOpcode::kEor:
-      builder_.Gen<x86_64::PxorXRegXReg>(vn.machine_reg(), vm.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(vn.machine_reg(), vm.machine_reg());
       break;
     case Decoder::AdvSimdThreeSameOpcode::kCmeq:
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PcmpeqbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpeqbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpeqwXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b10) {
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PcmpeqqXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpeqqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     case Decoder::AdvSimdThreeSameOpcode::kCmgt:
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PcmpgtbXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpgtbXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b01) {
-        builder_.Gen<x86_64::PcmpgtwXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpgtwXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else if (args.size == 0b10) {
-        builder_.Gen<x86_64::PcmpgtdXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpgtdXRegXReg>(vn.machine_reg(), vm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(vn.machine_reg(), vm.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(vn.machine_reg(), vm.machine_reg());
       }
       break;
     default:
@@ -8906,8 +8931,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_o);
       builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
       const int8_t imm = args.q ? int8_t{0x11} : int8_t{0x00};
-      builder_.Gen<x86_64::PclmulqdqXRegXRegImm>(
-          xn.machine_reg(), xm.machine_reg(), imm);
+      GenRaw<x86_64::PclmulqdqXRegXRegImm>(xn.machine_reg(), xm.machine_reg(), imm);
       SetVRegFull(args.rd, xn, /*q=*/true);
       return;
     }
@@ -8922,23 +8946,21 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
       // 16-bit lanes (Q=1 loads bytes 8..15 via the +8 offset).
       builder_.GenGetSimd<8>(za.machine_reg(), vn_o + extra);
       builder_.GenGetSimd<8>(zb.machine_reg(), vm_o + extra);
-      builder_.Gen<x86_64::PmovzxbwXRegXReg>(za.machine_reg(), za.machine_reg());
-      builder_.Gen<x86_64::PmovzxbwXRegXReg>(zb.machine_reg(), zb.machine_reg());
+      GenRaw<x86_64::PmovzxbwXRegXReg>(za.machine_reg(), za.machine_reg());
+      GenRaw<x86_64::PmovzxbwXRegXReg>(zb.machine_reg(), zb.machine_reg());
       for (int i = 0; i < 8; ++i) {
-        builder_.Gen<x86_64::MovdqaXRegXReg>(shifted.machine_reg(), za.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(shifted.machine_reg(), za.machine_reg());
         if (i != 0) {
-          builder_.Gen<x86_64::PsllwXRegImm>(shifted.machine_reg(),
-                                             static_cast<int8_t>(i));
+          GenRaw<x86_64::PsllwXRegImm>(shifted.machine_reg(), static_cast<int8_t>(i));
         }
         // sel = 0xFFFF per lane where bit i of zb is set.
-        builder_.Gen<x86_64::MovdqaXRegXReg>(sel.machine_reg(), zb.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(sel.machine_reg(), zb.machine_reg());
         if (15 - i != 0) {
-          builder_.Gen<x86_64::PsllwXRegImm>(sel.machine_reg(),
-                                             static_cast<int8_t>(15 - i));
+          GenRaw<x86_64::PsllwXRegImm>(sel.machine_reg(), static_cast<int8_t>(15 - i));
         }
-        builder_.Gen<x86_64::PsrawXRegImm>(sel.machine_reg(), int8_t{15});
-        builder_.Gen<x86_64::PandXRegXReg>(shifted.machine_reg(), sel.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(acc.machine_reg(), shifted.machine_reg());
+        GenRaw<x86_64::PsrawXRegImm>(sel.machine_reg(), int8_t{15});
+        GenRaw<x86_64::PandXRegXReg>(shifted.machine_reg(), sel.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(acc.machine_reg(), shifted.machine_reg());
       }
       SetVRegFull(args.rd, acc, /*q=*/true);
       return;
@@ -8978,55 +9000,73 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
     // already wide, so only shift it for the L-forms.
     if (args.q) {
       if (!n_is_wide) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
       }
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
     }
     // Widen Vn (skip for W-forms — Vn is already a wide-lane vector).
     if (!n_is_wide) {
       switch (args.size) {
         case 0b00:
-          if (addsub_signed) builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          else builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          if (addsub_signed)
+            GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          else
+            GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
           break;
         case 0b01:
-          if (addsub_signed) builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          else builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          if (addsub_signed)
+            GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          else
+            GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
           break;
         case 0b10:
-          if (addsub_signed) builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          else builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          if (addsub_signed)
+            GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          else
+            GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
           break;
       }
     }
     // Widen Vm (always narrow).
     switch (args.size) {
       case 0b00:
-        if (addsub_signed) builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        if (addsub_signed)
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
         break;
       case 0b01:
-        if (addsub_signed) builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        if (addsub_signed)
+          GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
         break;
       case 0b10:
-        if (addsub_signed) builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        if (addsub_signed)
+          GenRaw<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
         break;
     }
     // xn = Vn +/- Vm at the wide lane width.
     switch (args.size) {
       case 0b00:
-        if (is_add) builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        if (is_add)
+          GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case 0b01:
-        if (is_add) builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        if (is_add)
+          GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case 0b10:
-        if (is_add) builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        else builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        if (is_add)
+          GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        else
+          GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
     }
     SetVRegFull(args.rd, xn, /*q=*/true);
@@ -9067,36 +9107,36 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off_ab);
     // Q=1 ("2" form) selects the upper 64 of the narrow sources.
     if (args.q) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
     }
     // Widen both narrow sources to the wide lane width.
     switch (args.size) {
       case 0b00:
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
         }
         break;
       case 0b01:
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
         }
         break;
       case 0b10:
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
         }
         break;
     }
@@ -9105,15 +9145,15 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
       // 32->64: diff = a - b at 64-bit lane width, then signed-abs via
       // Pcmpgtq against zero. Correct for both signs because the widening
       // already injected the correct sign/zero extension.
-      builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       FpRegister mask = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
-      builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
       if (is_abal) {
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off_ab);
-        builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
         SetVRegFull(args.rd, xd, /*q=*/true);
       } else {
         SetVRegFull(args.rd, xn, /*q=*/true);
@@ -9124,33 +9164,33 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
     // 8->16 / 16->32: abs diff = max(a,b) - min(a,b). Copy Vn into xmax
     // (max clobbers its dst), leaving xn to hold the min.
     FpRegister xmax = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmax.machine_reg(), xn.machine_reg());
     if (args.size == 0b00) {
       if (is_signed) {
-        builder_.Gen<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmaxswXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmaxuwXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
-      builder_.Gen<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsubwXRegXReg>(xmax.machine_reg(), xn.machine_reg());
     } else {  // size == 0b01
       if (is_signed) {
-        builder_.Gen<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmaxsdXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmaxudXRegXReg>(xmax.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
-      builder_.Gen<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsubdXRegXReg>(xmax.machine_reg(), xn.machine_reg());
     }
     if (is_abal) {
       FpRegister xd = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off_ab);
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xmax.machine_reg());
       } else {
-        builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xmax.machine_reg());
       }
       SetVRegFull(args.rd, xd, /*q=*/true);
     } else {
@@ -9192,53 +9232,52 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
       FpRegister x = AllocTempSimdReg();
       Register gr =
           std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
-      builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+      GenRaw<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+      GenRaw<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
       return x;
     };
 
     if (args.size == 0b10) {
       if (is_sub) {
-        builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
       if (is_round) {
         FpRegister xr = broadcast(uint64_t{0x0000000080000000ULL});
-        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
       }
-      builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{32});
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                              int8_t{0b00001000});
+      GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), int8_t{32});
+      GenRaw<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0b00001000});
       SetVRegNarrow(args.rd, xn, args.q);
       return;
     }
     if (args.size == 0b00) {
       if (is_sub) {
-        builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
       if (is_round) {
         FpRegister xr = broadcast(uint64_t{0x0080008000800080ULL});
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
       }
-      builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
       FpRegister xz = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+      GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
     } else {  // size == 0b01
       if (is_sub) {
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
       if (is_round) {
         FpRegister xr = broadcast(uint64_t{0x0000800000008000ULL});
-        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
       }
-      builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
       FpRegister xz = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+      GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
     }
     SetVRegNarrow(args.rd, xn, args.q);
     return;
@@ -9274,8 +9313,8 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
       FpRegister x = AllocTempSimdReg();
       Register gr =
           std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
-      builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+      GenRaw<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+      GenRaw<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
       return x;
     };
 
@@ -9285,35 +9324,35 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
     // Q=1 ("2") forms take the upper 64 bits of the narrow sources.
     if (args.q) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
     }
 
     // Compute the doubled, saturated product P into xP (128 bits: 4S or 2D).
     FpRegister xP = broadcast(args.size == 0b01 ? uint64_t{0x4000000040000000ULL}
                                                 : uint64_t{0x4000000000000000ULL});
     if (args.size == 0b01) {
-      builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
       // xP starts as INT16_MIN^2 (0x40000000 per lane); mark == lanes.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
       FpRegister xsat = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
-      builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());   // SMAX in sat lanes
-      builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());    // doubled in non-sat
-      builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());    // xP = P
+      GenRaw<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());  // SMAX in sat lanes
+      GenRaw<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());   // doubled in non-sat
+      GenRaw<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());   // xP = P
     } else {  // size == 0b10
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       // xP starts as INT32_MIN^2 (2^62 per qword); mark == lanes.
-      builder_.Gen<x86_64::PcmpeqqXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+      GenRaw<x86_64::PcmpeqqXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
       FpRegister xsat = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
-      builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
     }
 
     if (!is_acc) {
@@ -9329,61 +9368,64 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
     FpRegister xtmp = AllocTempSimdReg();
     if (args.size == 0b01) {
       if (is_sub) {
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
-        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), xP.machine_reg());  // diff = a - P
+        GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());  // a ^ P
+        GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+        GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
       } else {
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
-        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xres.machine_reg(), xP.machine_reg());  // sum = a + P
+        GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());  // a ^ sum
+        GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+        GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
       }
-      builder_.Gen<x86_64::PsradXRegImm>(xof.machine_reg(), int8_t{31});  // overflow lanes
-      builder_.Gen<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});   // a's sign (0 / -1)
+      GenRaw<x86_64::PsradXRegImm>(xof.machine_reg(), int8_t{31});  // overflow lanes
+      GenRaw<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});   // a's sign (0 / -1)
       FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
-      builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xmaxc.machine_reg());   // sat = (a>>31)^INT32_MAX
-      builder_.Gen<x86_64::PandXRegXReg>(xd.machine_reg(), xof.machine_reg());     // sat in overflow lanes
-      builder_.Gen<x86_64::PandnXRegXReg>(xof.machine_reg(), xres.machine_reg());  // result in non-overflow
-      builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), xof.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(),
+                                   xmaxc.machine_reg());                  // sat = (a>>31)^INT32_MAX
+      GenRaw<x86_64::PandXRegXReg>(xd.machine_reg(), xof.machine_reg());  // sat in overflow lanes
+      GenRaw<x86_64::PandnXRegXReg>(xof.machine_reg(),
+                                    xres.machine_reg());  // result in non-overflow
+      GenRaw<x86_64::PorXRegXReg>(xd.machine_reg(), xof.machine_reg());
       SetVRegFull(args.rd, xd, /*q=*/true);
       return;
     }
     // size == 0b10 accumulate (64-bit signed saturating).
     FpRegister xzero = AllocZeroedSimdReg();
     if (is_sub) {
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PsubqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
-      builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(xres.machine_reg(), xP.machine_reg());  // diff = a - P
+      GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());  // a ^ P
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+      GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
     } else {
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
-      builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(xres.machine_reg(), xP.machine_reg());  // sum = a + P
+      GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());  // a ^ sum
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+      GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
     }
     // overflow_mask (xtmp) = all-ones per qword where xof < 0 (sign set).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
-    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xtmp.machine_reg(), xof.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
+    GenRaw<x86_64::PcmpgtqXRegXReg>(xtmp.machine_reg(), xof.machine_reg());
     // sat = sign(a) ^ INT64_MAX  (INT64_MIN if a<0, else INT64_MAX).
-    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xzero.machine_reg(), xd.machine_reg());  // all-ones where a<0
+    GenRaw<x86_64::PcmpgtqXRegXReg>(xzero.machine_reg(), xd.machine_reg());  // all-ones where a<0
     FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
-    builder_.Gen<x86_64::PxorXRegXReg>(xzero.machine_reg(), xmaxc.machine_reg());  // xzero = sat value
-    builder_.Gen<x86_64::PandXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());   // sat in overflow lanes
-    builder_.Gen<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xres.machine_reg());   // result in non-overflow
-    builder_.Gen<x86_64::PorXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xzero.machine_reg(), xmaxc.machine_reg());  // xzero = sat value
+    GenRaw<x86_64::PandXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());  // sat in overflow lanes
+    GenRaw<x86_64::PandnXRegXReg>(xtmp.machine_reg(),
+                                  xres.machine_reg());  // result in non-overflow
+    GenRaw<x86_64::PorXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());
     SetVRegFull(args.rd, xzero, /*q=*/true);
     return;
   }
@@ -9408,39 +9450,39 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
   builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
   builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
   if (args.q) {
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+    GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
   }
   switch (args.size) {
     case 0b00:
       if (is_signed) {
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovsxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovzxbwXRegXReg>(xm.machine_reg(), xm.machine_reg());
       }
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
       break;
     case 0b01:
       if (is_signed) {
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
       }
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
       break;
     case 0b10:
       if (is_signed) {
-        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovsxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PmuludqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PmovzxdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PmuludqXRegXReg>(xn.machine_reg(), xm.machine_reg());
       }
       break;
   }
@@ -9457,23 +9499,23 @@ void HeavyOptimizerFrontend::AdvSimdThreeDiff(const Decoder::AdvSimdThreeDiffArg
   switch (args.size) {
     case 0b00:
       if (is_mlal) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
       break;
     case 0b01:
       if (is_mlal) {
-        builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
       break;
     case 0b10:
       if (is_mlal) {
-        builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubqXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
       break;
   }
@@ -9574,16 +9616,16 @@ void HeavyOptimizerFrontend::AdvSimdSingleStruct(const Decoder::AdvSimdSingleStr
         const int8_t lane = static_cast<int8_t>(l);
         switch (esize) {
           case 1:
-            builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
+            GenRaw<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
             break;
           case 2:
-            builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
+            GenRaw<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
             break;
           case 4:
-            builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
+            GenRaw<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
             break;
           default:  // esize == 8
-            builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
+            GenRaw<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
             break;
         }
       }
@@ -9605,22 +9647,22 @@ void HeavyOptimizerFrontend::AdvSimdSingleStruct(const Decoder::AdvSimdSingleStr
         case 1:
           elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = base, .disp = disp}));
           GenRecoveryBlockForLastInsn();
-          builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
+          GenRaw<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
           break;
         case 2:
           elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = base, .disp = disp}));
           GenRecoveryBlockForLastInsn();
-          builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
+          GenRaw<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
           break;
         case 4:
           elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = base, .disp = disp}));
           GenRecoveryBlockForLastInsn();
-          builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
+          GenRaw<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
           break;
         default:  // esize == 8
           elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = base, .disp = disp}));
           GenRecoveryBlockForLastInsn();
-          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
+          GenRaw<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
           break;
       }
       builder_.GenSetSimd<16>(GetVRegOffset(reg), xmm.machine_reg());
@@ -9695,70 +9737,70 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
 
       // nan_val = (n >> 16) | 0x0040.
       FpRegister xone = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xnan_val.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(xnan_val.machine_reg(), int8_t{16});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(xtmp.machine_reg(), int8_t{6});  // 0x00000040
-      builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xone.machine_reg(), int8_t{31});  // 0x00000001
+      GenRaw<x86_64::MovdqaXRegXReg>(xnan_val.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xnan_val.machine_reg(), int8_t{16});
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(xtmp.machine_reg(), int8_t{6});  // 0x00000040
+      GenRaw<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
 
       // bias = ((n >> 16) & 1) + 0x7FFF.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
-      builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
+      GenRaw<x86_64::PandXRegXReg>(xtmp.machine_reg(), xone.machine_reg());
       FpRegister x7fff = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(x7fff.machine_reg(), int8_t{17});  // 0x00007FFF
-      builder_.Gen<x86_64::PadddXRegXReg>(xtmp.machine_reg(), x7fff.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(x7fff.machine_reg(), int8_t{17});  // 0x00007FFF
+      GenRaw<x86_64::PadddXRegXReg>(xtmp.machine_reg(), x7fff.machine_reg());
 
       // rounded = (n + bias) >> 16, kept in the low 16 bits of each dword. The
       // original lanes are needed afterwards for the NaN test, so keep a copy.
       FpRegister xorig = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xorig.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xtmp.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+      GenRaw<x86_64::MovdqaXRegXReg>(xorig.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
 
       // nan_mask = (n & 0x7F800000) == 0x7F800000  AND  (n & 0x007FFFFF) != 0.
       FpRegister xexpmask = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(xexpmask.machine_reg(), int8_t{24});  // 0x000000FF
-      builder_.Gen<x86_64::PslldXRegImm>(xexpmask.machine_reg(), int8_t{23});  // 0x7F800000
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xexp.machine_reg(), xorig.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xexpmask.machine_reg(), int8_t{24});  // 0x000000FF
+      GenRaw<x86_64::PslldXRegImm>(xexpmask.machine_reg(), int8_t{23});  // 0x7F800000
+      GenRaw<x86_64::MovdqaXRegXReg>(xexp.machine_reg(), xorig.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xexp.machine_reg(), xexpmask.machine_reg());
 
       FpRegister xmantmask = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsrldXRegImm>(xmantmask.machine_reg(), int8_t{9});  // 0x007FFFFF
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xorig.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xtmp.machine_reg(), xmantmask.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xmantmask.machine_reg(), int8_t{9});  // 0x007FFFFF
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xorig.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xtmp.machine_reg(), xmantmask.machine_reg());
       FpRegister xzero = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
       FpRegister xallones = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xallones.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xexp.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xallones.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xexp.machine_reg(), xtmp.machine_reg());
 
       // out = (nan_mask & nan_val) | (~nan_mask & rounded).
-      builder_.Gen<x86_64::PandXRegXReg>(xnan_val.machine_reg(), xexp.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xexp.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xnan_val.machine_reg(), xexp.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xexp.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xtmp.machine_reg());
 
       // 4 dwords -> 4 words. PACKUSDW saturates unsigned, and every dword here
       // holds a 16-bit value, so no lane is clamped; the result is duplicated
       // into both 64-bit halves.
-      builder_.Gen<x86_64::PackusdwXRegXReg>(xnan_val.machine_reg(), xnan_val.machine_reg());
+      GenRaw<x86_64::PackusdwXRegXReg>(xnan_val.machine_reg(), xnan_val.machine_reg());
 
       if (!args.q) {
         // BFCVTN: low 64 bits of Vd, upper 64 zeroed.
-        builder_.Gen<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
         SetVRegFull(args.rd, xnan_val, /*q=*/true);
       } else {
         // BFCVTN2: high 64 bits of Vd, low half preserved.
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
-        builder_.Gen<x86_64::PslldqXRegImm>(xd.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PslldqXRegImm>(xd.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PslldqXRegImm>(xnan_val.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PorXRegXReg>(xnan_val.machine_reg(), xd.machine_reg());
         SetVRegFull(args.rd, xnan_val, /*q=*/true);
       }
       return;
@@ -9775,10 +9817,10 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       FpRegister xt = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PsrlwXRegImm>(xt.machine_reg(), int8_t{8});
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xt.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrlwXRegImm>(xt.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xt.machine_reg());
       SetVRegFull(args.rd, xn, args.q);
       return;
     }
@@ -9797,21 +9839,19 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b00: {
           FpRegister xmask = AllocTempSimdReg();
           Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0001020304050607LL}));
-          builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+          GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
           Register mhi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x08090A0B0C0D0E0FLL}));
-          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
-          builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+          GenRaw<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
+          GenRaw<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
           break;
         }
         case 0b01:
-          builder_.Gen<x86_64::PshuflwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                   int8_t{0x1B});
-          builder_.Gen<x86_64::PshufhwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                   int8_t{0x1B});
+          GenRaw<x86_64::PshuflwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x1B});
+          GenRaw<x86_64::PshufhwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x1B});
           break;
         case 0b10:
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                  static_cast<int8_t>(0xB1));
+          GenRaw<x86_64::PshufdXRegXRegImm>(
+              xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
           break;
         default:  // 0b11 reserved
           UndefinedReturningVoid();
@@ -9832,17 +9872,17 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         case 0b00: {
           FpRegister xmask = AllocTempSimdReg();
           Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0405060700010203LL}));
-          builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+          GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
           Register mhi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0C0D0E0F08090A0BLL}));
-          builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
-          builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+          GenRaw<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), mhi, int8_t{1});
+          GenRaw<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
           break;
         }
         case 0b01:
-          builder_.Gen<x86_64::PshuflwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                   static_cast<int8_t>(0xB1));
-          builder_.Gen<x86_64::PshufhwXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                   static_cast<int8_t>(0xB1));
+          GenRaw<x86_64::PshuflwXRegXRegImm>(
+              xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
+          GenRaw<x86_64::PshufhwXRegXRegImm>(
+              xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
           break;
         default:  // size >= 0b10 reserved
           UndefinedReturningVoid();
@@ -9867,25 +9907,25 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xt_hi = AllocTempSimdReg();
       // Build the popcount nibble table {0,1,1,2,...,4} into xtable_lo.
       Register tlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0302020102010100LL}));
-      builder_.Gen<x86_64::MovqXRegReg>(xtable_lo.machine_reg(), tlo);
+      GenRaw<x86_64::MovqXRegReg>(xtable_lo.machine_reg(), tlo);
       Register thi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0403030203020201LL}));
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(xtable_lo.machine_reg(), thi, int8_t{1});
+      GenRaw<x86_64::PinsrqXRegRegImm>(xtable_lo.machine_reg(), thi, int8_t{1});
       // PSHUFB is destructive; keep a second copy of the table.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtable_hi.machine_reg(), xtable_lo.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xtable_hi.machine_reg(), xtable_lo.machine_reg());
       // Build the 0x0F low-nibble mask, broadcast to all 16 bytes.
       Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F0F0F0F0F0F0F0FLL}));
-      builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
-      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+      GenRaw<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
       // Split Vn into low and high nibbles.
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xt_hi.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsrlwXRegImm>(xt_hi.machine_reg(), int8_t{4});
-      builder_.Gen<x86_64::PandXRegXReg>(xt_hi.machine_reg(), xmask.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xt_hi.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsrlwXRegImm>(xt_hi.machine_reg(), int8_t{4});
+      GenRaw<x86_64::PandXRegXReg>(xt_hi.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
       // Vd = PSHUFB(table, low_nibbles) + PSHUFB(table, high_nibbles).
-      builder_.Gen<x86_64::PshufbXRegXReg>(xtable_lo.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PshufbXRegXReg>(xtable_hi.machine_reg(), xt_hi.machine_reg());
-      builder_.Gen<x86_64::PaddbXRegXReg>(xtable_lo.machine_reg(), xtable_hi.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(xtable_lo.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(xtable_hi.machine_reg(), xt_hi.machine_reg());
+      GenRaw<x86_64::PaddbXRegXReg>(xtable_lo.machine_reg(), xtable_hi.machine_reg());
       SetVRegFull(args.rd, xtable_lo, args.q);
       return;
     }
@@ -9899,8 +9939,8 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister xn = AllocTempSimdReg();
         FpRegister allones = AllocZeroedSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(allones.machine_reg(), allones.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), allones.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(allones.machine_reg(), allones.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), allones.machine_reg());
         SetVRegFull(args.rd, xn, args.q);
         return;
       }
@@ -9912,30 +9952,30 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister xn_hi = AllocTempSimdReg();
         // low_table[i]  = reverse4(i)       (result in low nibble)
         Register lt_lo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0E060A020C040800LL}));
-        builder_.Gen<x86_64::MovqXRegReg>(xlow_table.machine_reg(), lt_lo);
+        GenRaw<x86_64::MovqXRegReg>(xlow_table.machine_reg(), lt_lo);
         Register lt_hi = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F070B030D050901LL}));
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(xlow_table.machine_reg(), lt_hi, int8_t{1});
+        GenRaw<x86_64::PinsrqXRegRegImm>(xlow_table.machine_reg(), lt_hi, int8_t{1});
         // high_table[i] = reverse4(i) << 4  (result in high nibble)
         Register ht_lo =
             std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0xE060A020C0408000ULL)));
-        builder_.Gen<x86_64::MovqXRegReg>(xhigh_table.machine_reg(), ht_lo);
+        GenRaw<x86_64::MovqXRegReg>(xhigh_table.machine_reg(), ht_lo);
         Register ht_hi =
             std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0xF070B030D0509010ULL)));
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(xhigh_table.machine_reg(), ht_hi, int8_t{1});
+        GenRaw<x86_64::PinsrqXRegRegImm>(xhigh_table.machine_reg(), ht_hi, int8_t{1});
         // Build the 0x0F broadcast mask.
         Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0x0F0F0F0F0F0F0F0FLL}));
-        builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), mlo);
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(xmask.machine_reg(), xmask.machine_reg());
         // t_lo = low nibbles, t_hi = high nibbles.
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{4});
-        builder_.Gen<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xmask.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), int8_t{4});
+        GenRaw<x86_64::PandXRegXReg>(xn_hi.machine_reg(), xmask.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xmask.machine_reg());
         // Vd = PSHUFB(high_table, t_lo) | PSHUFB(low_table, t_hi).
-        builder_.Gen<x86_64::PshufbXRegXReg>(xhigh_table.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PshufbXRegXReg>(xlow_table.machine_reg(), xn_hi.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(xhigh_table.machine_reg(), xlow_table.machine_reg());
+        GenRaw<x86_64::PshufbXRegXReg>(xhigh_table.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PshufbXRegXReg>(xlow_table.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(xhigh_table.machine_reg(), xlow_table.machine_reg());
         SetVRegFull(args.rd, xhigh_table, args.q);
         return;
       }
@@ -9955,16 +9995,16 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PsubbXRegXReg>(xz.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsubbXRegXReg>(xz.machine_reg(), xn.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PsubwXRegXReg>(xz.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsubwXRegXReg>(xz.machine_reg(), xn.machine_reg());
           break;
         case 0b10:
-          builder_.Gen<x86_64::PsubdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsubdXRegXReg>(xz.machine_reg(), xn.machine_reg());
           break;
         default:  // 0b11 (.2D, Q=1)
-          builder_.Gen<x86_64::PsubqXRegXReg>(xz.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsubqXRegXReg>(xz.machine_reg(), xn.machine_reg());
           break;
       }
       SetVRegFull(args.rd, xz, args.q);
@@ -9985,31 +10025,31 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PcmpgtbXRegXReg>(mask.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtbXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PcmpgtwXRegXReg>(mask.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtwXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
         case 0b10:
-          builder_.Gen<x86_64::PcmpgtdXRegXReg>(mask.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtdXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
         default:  // 0b11 (.2D)
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(mask.machine_reg(), xn.machine_reg());
           break;
       }
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PsubbXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsubbXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PsubwXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsubwXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
         case 0b10:
-          builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
         default:  // 0b11 (.2D)
-          builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), mask.machine_reg());
           break;
       }
       SetVRegFull(args.rd, xn, args.q);
@@ -10027,13 +10067,13 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister lo = no_fp_register, hi = no_fp_register;
         EmitWidenHalfVec(vn_off, args.q, &lo, &hi);
         FpRegister z = AllocZeroedSimdReg();  // +0.0 per lane; Cmpeqps leaves src z intact
-        builder_.Gen<x86_64::CmpeqpsXRegXReg>(lo.machine_reg(), z.machine_reg());
+        GenRaw<x86_64::CmpeqpsXRegXReg>(lo.machine_reg(), z.machine_reg());
         if (args.q) {
-          builder_.Gen<x86_64::CmpeqpsXRegXReg>(hi.machine_reg(), z.machine_reg());
-          builder_.Gen<x86_64::PackssdwXRegXReg>(lo.machine_reg(), hi.machine_reg());
+          GenRaw<x86_64::CmpeqpsXRegXReg>(hi.machine_reg(), z.machine_reg());
+          GenRaw<x86_64::PackssdwXRegXReg>(lo.machine_reg(), hi.machine_reg());
           SetVRegFull(args.rd, lo, true);
         } else {
-          builder_.Gen<x86_64::PackssdwXRegXReg>(lo.machine_reg(), lo.machine_reg());
+          GenRaw<x86_64::PackssdwXRegXReg>(lo.machine_reg(), lo.machine_reg());
           SetVRegFull(args.rd, lo, false);
         }
         return;
@@ -10043,16 +10083,16 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PcmpeqbXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PcmpeqwXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         case 0b10:
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         default:  // 0b11 (.2D): PCMPEQQ (SSE4.1).
-          builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
       }
       SetVRegFull(args.rd, xn, args.q);
@@ -10086,22 +10126,26 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           FpRegister z = AllocZeroedSimdReg();
           switch (args.opcode) {
             case Op::kCmgtZero:
-              builder_.Gen<x86_64::CmpltpsXRegXReg>(z.machine_reg(), v.machine_reg()); return z;
+              GenRaw<x86_64::CmpltpsXRegXReg>(z.machine_reg(), v.machine_reg());
+              return z;
             case Op::kCmgeZero:
-              builder_.Gen<x86_64::CmplepsXRegXReg>(z.machine_reg(), v.machine_reg()); return z;
+              GenRaw<x86_64::CmplepsXRegXReg>(z.machine_reg(), v.machine_reg());
+              return z;
             case Op::kCmltZero:
-              builder_.Gen<x86_64::CmpltpsXRegXReg>(v.machine_reg(), z.machine_reg()); return v;
+              GenRaw<x86_64::CmpltpsXRegXReg>(v.machine_reg(), z.machine_reg());
+              return v;
             default:  // kCmleZero
-              builder_.Gen<x86_64::CmplepsXRegXReg>(v.machine_reg(), z.machine_reg()); return v;
+              GenRaw<x86_64::CmplepsXRegXReg>(v.machine_reg(), z.machine_reg());
+              return v;
           }
         };
         FpRegister rlo = cmp(lo);
         if (args.q) {
           FpRegister rhi = cmp(hi);
-          builder_.Gen<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rhi.machine_reg());
+          GenRaw<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rhi.machine_reg());
           SetVRegFull(args.rd, rlo, true);
         } else {
-          builder_.Gen<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rlo.machine_reg());
+          GenRaw<x86_64::PackssdwXRegXReg>(rlo.machine_reg(), rlo.machine_reg());
           SetVRegFull(args.rd, rlo, false);
         }
         return;
@@ -10126,21 +10170,21 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister b = n_gt_z ? xz : xn;
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::PcmpgtbXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::PcmpgtwXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
         case 0b10:
-          builder_.Gen<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::PcmpgtdXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
         default:  // 0b11 (.2D)
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(a.machine_reg(), b.machine_reg());
           break;
       }
       if (invert) {
         FpRegister ones = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(res.machine_reg(), ones.machine_reg());
       }
       SetVRegFull(args.rd, res, args.q);
       return;
@@ -10181,36 +10225,36 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       switch (args.opcode) {
         case Op::kFcmeqZero:
           if (is_double)
-            builder_.Gen<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmpeqpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
           else
-            builder_.Gen<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmpeqpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         case Op::kFcmltZero:
           if (is_double)
-            builder_.Gen<x86_64::CmpltpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmpltpdXRegXReg>(xn.machine_reg(), xz.machine_reg());
           else
-            builder_.Gen<x86_64::CmpltpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmpltpsXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         case Op::kFcmleZero:
           if (is_double)
-            builder_.Gen<x86_64::CmplepdXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmplepdXRegXReg>(xn.machine_reg(), xz.machine_reg());
           else
-            builder_.Gen<x86_64::CmplepsXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::CmplepsXRegXReg>(xn.machine_reg(), xz.machine_reg());
           break;
         case Op::kFcmgtZero:
           // Vn > 0 <=> 0 < Vn; mask lands in xz.
           if (is_double)
-            builder_.Gen<x86_64::CmpltpdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::CmpltpdXRegXReg>(xz.machine_reg(), xn.machine_reg());
           else
-            builder_.Gen<x86_64::CmpltpsXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::CmpltpsXRegXReg>(xz.machine_reg(), xn.machine_reg());
           res = xz;
           break;
         case Op::kFcmgeZero:
           // Vn >= 0 <=> 0 <= Vn; mask lands in xz.
           if (is_double)
-            builder_.Gen<x86_64::CmplepdXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::CmplepdXRegXReg>(xz.machine_reg(), xn.machine_reg());
           else
-            builder_.Gen<x86_64::CmplepsXRegXReg>(xz.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::CmplepsXRegXReg>(xz.machine_reg(), xn.machine_reg());
           res = xz;
           break;
         default:
@@ -10237,17 +10281,16 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
             args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
                               : int64_t{0x0000FFFF0000FFFFLL}));
-        builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
         if (args.size == 0b00) {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
         }
       } else if (args.size == 0b10) {
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
-                                                int8_t{0b00001000});
+        GenRaw<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0b00001000});
       } else {  // size=11 reserved
         UndefinedReturningVoid();
         return;
@@ -10269,20 +10312,20 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       if (args.q) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
       }
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
           break;
         case 0b01:
-          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+          GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
           break;
         default:  // 0b10
-          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), int8_t{32});
+          GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsllqXRegImm>(xn.machine_reg(), int8_t{32});
           break;
       }
       SetVRegFull(args.rd, xn, /*q=*/true);
@@ -10312,56 +10355,55 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         // Broadcast a 64-bit constant into both lanes.
         auto set_const = [&](FpRegister r, int64_t v) {
           Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
-          builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+          GenRaw<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
         };
         // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
         auto blend = [&](FpRegister val, FpRegister mask) {
           FpRegister t = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
         };
         if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtn) {
           FpRegister c = AllocTempSimdReg();
           FpRegister m = AllocTempSimdReg();
           set_const(c, int64_t{0x000000007FFFFFFFLL});  // INT32_MAX
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
           blend(c, m);
           set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
           blend(c, m);
         } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
           FpRegister c = AllocTempSimdReg();
           FpRegister m = AllocTempSimdReg();
           set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
           blend(c, m);
           FpRegister z = AllocZeroedSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
-          builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());     // neg -> 0
-          builder_.Gen<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
+          GenRaw<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());    // neg -> 0
+          GenRaw<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
         } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
           FpRegister c = AllocTempSimdReg();
           FpRegister m = AllocTempSimdReg();
           set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
           FpRegister z = AllocZeroedSimdReg();
-          builder_.Gen<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
+          GenRaw<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
           FpRegister t = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
-          builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
+          GenRaw<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
         }
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(),
-                                                int8_t{0b00001000});
+        GenRaw<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(), int8_t{0b00001000});
         SetVRegNarrow(args.rd, x, args.q);
         return;
       }
@@ -10377,26 +10419,26 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
             args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
                               : int64_t{0x0000FFFF0000FFFFLL}));
-        builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
         if (args.size == 0b00) {
-          builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
         } else {
-          builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
-          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
         }
       } else if (opc == Decoder::AdvSimdTwoRegMiscOpcode::kSqxtun) {
         if (args.size == 0b00) {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
         }
       } else {  // kSqxtn
         if (args.size == 0b00) {
-          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xz.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PackssdwXRegXReg>(xn.machine_reg(), xz.machine_reg());
         }
       }
       SetVRegNarrow(args.rd, xn, args.q);
@@ -10432,41 +10474,41 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         auto widen_lo = [&](FpRegister r, bool is_signed) {
           if (args.size == 0b00) {
             if (is_signed) {
-              builder_.Gen<x86_64::PmovsxbwXRegXReg>(r.machine_reg(), r.machine_reg());
+              GenRaw<x86_64::PmovsxbwXRegXReg>(r.machine_reg(), r.machine_reg());
             } else {
-              builder_.Gen<x86_64::PmovzxbwXRegXReg>(r.machine_reg(), r.machine_reg());
+              GenRaw<x86_64::PmovzxbwXRegXReg>(r.machine_reg(), r.machine_reg());
             }
           } else {
             if (is_signed) {
-              builder_.Gen<x86_64::PmovsxwdXRegXReg>(r.machine_reg(), r.machine_reg());
+              GenRaw<x86_64::PmovsxwdXRegXReg>(r.machine_reg(), r.machine_reg());
             } else {
-              builder_.Gen<x86_64::PmovzxwdXRegXReg>(r.machine_reg(), r.machine_reg());
+              GenRaw<x86_64::PmovzxwdXRegXReg>(r.machine_reg(), r.machine_reg());
             }
           }
         };
         auto add_wide = [&](FpRegister a, FpRegister b) {
           if (args.size == 0b00) {
-            builder_.Gen<x86_64::PaddwXRegXReg>(a.machine_reg(), b.machine_reg());
+            GenRaw<x86_64::PaddwXRegXReg>(a.machine_reg(), b.machine_reg());
           } else {
-            builder_.Gen<x86_64::PadddXRegXReg>(a.machine_reg(), b.machine_reg());
+            GenRaw<x86_64::PadddXRegXReg>(a.machine_reg(), b.machine_reg());
           }
         };
         // Vd carries the destination flavour (SUQADD signed / USQADD unsigned);
         // Vn carries the opposite signedness.
         FpRegister dlo = AllocTempSimdReg();
         FpRegister nlo = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(dlo.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(nlo.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(dlo.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(nlo.machine_reg(), xn.machine_reg());
         widen_lo(dlo, /*is_signed=*/!usqadd);
         widen_lo(nlo, /*is_signed=*/usqadd);
         add_wide(dlo, nlo);  // dlo = widened lane sums (low half)
         FpRegister hi = args.q ? AllocTempSimdReg() : AllocZeroedSimdReg();
         if (args.q) {
-          builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
           FpRegister nhi = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(hi.machine_reg(), xd.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(nhi.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(hi.machine_reg(), xd.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(nhi.machine_reg(), xn.machine_reg());
           widen_lo(hi, /*is_signed=*/!usqadd);
           widen_lo(nhi, /*is_signed=*/usqadd);
           add_wide(hi, nhi);  // hi = widened lane sums (high half)
@@ -10474,15 +10516,15 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         // Narrow with the destination-signedness saturating pack.
         if (args.size == 0b00) {
           if (usqadd) {
-            builder_.Gen<x86_64::PackuswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            GenRaw<x86_64::PackuswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
           } else {
-            builder_.Gen<x86_64::PacksswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            GenRaw<x86_64::PacksswbXRegXReg>(dlo.machine_reg(), hi.machine_reg());
           }
         } else {
           if (usqadd) {
-            builder_.Gen<x86_64::PackusdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            GenRaw<x86_64::PackusdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
           } else {
-            builder_.Gen<x86_64::PackssdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
+            GenRaw<x86_64::PackssdwXRegXReg>(dlo.machine_reg(), hi.machine_reg());
           }
         }
         SetVRegFull(args.rd, dlo, args.q);
@@ -10500,55 +10542,54 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
                                      : static_cast<int64_t>(0xFFFFFFFF80000000ULL);  // INT32_MIN
         auto set_const = [&](FpRegister r, int64_t v) {
           Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
-          builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+          GenRaw<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
         };
         // dst = (mask ? val : dst) via dst ^= (dst ^ val) & mask.
         auto blend = [&](FpRegister dst, FpRegister val, FpRegister mask) {
           FpRegister t = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), dst.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
-          builder_.Gen<x86_64::PxorXRegXReg>(dst.machine_reg(), t.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), dst.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PxorXRegXReg>(dst.machine_reg(), t.machine_reg());
         };
         // Widen the low 2 dwords of (d,n) to 64-bit lanes, add, clamp to the
         // destination range, and gather the two clamped low dwords into the
         // low 64 bits (PSHUFD 0b00001000). Consumes d and n; returns d.
         auto process_half = [&](FpRegister d, FpRegister n) -> FpRegister {
           if (usqadd) {
-            builder_.Gen<x86_64::PmovzxdqXRegXReg>(d.machine_reg(), d.machine_reg());
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(n.machine_reg(), n.machine_reg());
+            GenRaw<x86_64::PmovzxdqXRegXReg>(d.machine_reg(), d.machine_reg());
+            GenRaw<x86_64::PmovsxdqXRegXReg>(n.machine_reg(), n.machine_reg());
           } else {
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(d.machine_reg(), d.machine_reg());
-            builder_.Gen<x86_64::PmovzxdqXRegXReg>(n.machine_reg(), n.machine_reg());
+            GenRaw<x86_64::PmovsxdqXRegXReg>(d.machine_reg(), d.machine_reg());
+            GenRaw<x86_64::PmovzxdqXRegXReg>(n.machine_reg(), n.machine_reg());
           }
-          builder_.Gen<x86_64::PaddqXRegXReg>(d.machine_reg(), n.machine_reg());
+          GenRaw<x86_64::PaddqXRegXReg>(d.machine_reg(), n.machine_reg());
           FpRegister c = AllocTempSimdReg();
           FpRegister m = AllocTempSimdReg();
           // clamp above: where d > hi_bound, take hi_bound.
           set_const(c, hi_bound);
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), d.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), d.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());
           blend(d, c, m);
           // clamp below: where lo_bound > d, take lo_bound.
           set_const(c, lo_bound);
-          builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), d.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), d.machine_reg());
           blend(d, c, m);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(d.machine_reg(), d.machine_reg(),
-                                                  int8_t{0b00001000});
+          GenRaw<x86_64::PshufdXRegXRegImm>(d.machine_reg(), d.machine_reg(), int8_t{0b00001000});
           return d;
         };
         if (args.q) {
           FpRegister xdh = AllocTempSimdReg();
           FpRegister xnh = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xdh.machine_reg(), xd.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xnh.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsrldqXRegImm>(xdh.machine_reg(), int8_t{8});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xnh.machine_reg(), int8_t{8});
+          GenRaw<x86_64::MovdqaXRegXReg>(xdh.machine_reg(), xd.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(xnh.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrldqXRegImm>(xdh.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrldqXRegImm>(xnh.machine_reg(), int8_t{8});
           FpRegister lo = process_half(xd, xn);
           FpRegister hi = process_half(xdh, xnh);
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(lo.machine_reg(), hi.machine_reg());
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(lo.machine_reg(), hi.machine_reg());
           SetVRegFull(args.rd, lo, /*q=*/true);
         } else {
           FpRegister lo = process_half(xd, xn);
@@ -10593,16 +10634,16 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister xsign = AllocZeroedSimdReg();
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg());
             break;
           case 0b01:
-            builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg());
             break;
           default:  // 0b10
-            builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg());
             break;
         }
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xsign.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xsign.machine_reg());
       }
       for (int i = 0; i < lanes_per_vec; ++i) {
         Register lane;
@@ -10626,16 +10667,13 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         }
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PinsrbXRegRegImm>(xd.machine_reg(), cnt,
-                                                   static_cast<int8_t>(i));
+            GenRaw<x86_64::PinsrbXRegRegImm>(xd.machine_reg(), cnt, static_cast<int8_t>(i));
             break;
           case 0b01:
-            builder_.Gen<x86_64::PinsrwXRegRegImm>(xd.machine_reg(), cnt,
-                                                   static_cast<int8_t>(i));
+            GenRaw<x86_64::PinsrwXRegRegImm>(xd.machine_reg(), cnt, static_cast<int8_t>(i));
             break;
           default:  // 0b10
-            builder_.Gen<x86_64::PinsrdXRegRegImm>(xd.machine_reg(), cnt,
-                                                   static_cast<int8_t>(i));
+            GenRaw<x86_64::PinsrdXRegRegImm>(xd.machine_reg(), cnt, static_cast<int8_t>(i));
             break;
         }
       }
@@ -10658,28 +10696,27 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           FpRegister xz = AllocZeroedSimdReg();
           // xn := [sum(bytes 0..7), 0..., sum(bytes 8..15), 0...] (16-bit
           // sums in qword-lane positions).
-          builder_.Gen<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+          GenRaw<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
           if (args.q) {
             // .16B: fold the high-qword sum into the low qword.
             FpRegister xt = AllocTempSimdReg();
-            builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(),
-                                                    xn.machine_reg(),
-                                                    static_cast<int8_t>(0xEE));
-            builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            GenRaw<x86_64::PshufdXRegXRegImm>(
+                xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xEE));
+            GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
           }
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
           break;
         }
         case 0b01: {
           // .4H: 2 cascading PHADDW; .8H: 3.
-          builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
           if (args.q) {
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
           }
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
           break;
         }
         case 0b10: {
@@ -10688,10 +10725,10 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
             return;
           }
           // .4S: 2 cascading PHADDD.
-          builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
           break;
         }
         default:
@@ -10721,34 +10758,33 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           // Bytes -> 16-bit sum.
           if (!is_signed) {
             FpRegister xz = AllocZeroedSimdReg();
-            builder_.Gen<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
+            GenRaw<x86_64::PsadbwXRegXReg>(xn.machine_reg(), xz.machine_reg());
             if (args.q) {
               FpRegister xt = AllocTempSimdReg();
-              builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(),
-                                                      xn.machine_reg(),
-                                                      static_cast<int8_t>(0xEE));
-              builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+              GenRaw<x86_64::PshufdXRegXRegImm>(
+                  xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xEE));
+              GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
             }
           } else if (args.q) {
             // SADDLV .16B: widen low/high 8 bytes separately, lane-add, then
             // 3 PHADDW collapses.
             FpRegister xt = AllocTempSimdReg();
-            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xt.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xt.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PmovsxbwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
           } else {
             // SADDLV .8B: widen low 8 bytes; 3 PHADDW collapses.
-            builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhaddwXRegXReg>(xn.machine_reg(), xn.machine_reg());
           }
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
           break;
         }
         case 0b01: {
@@ -10756,28 +10792,28 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           if (args.q) {
             FpRegister xt = AllocTempSimdReg();
             if (is_signed) {
-              builder_.Gen<x86_64::PmovsxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
-              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-              builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PmovsxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+              GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
             } else {
-              builder_.Gen<x86_64::PmovzxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
-              builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-              builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PmovzxwdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+              GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
             }
-            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xt.machine_reg());
-            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xt.machine_reg());
+            GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
           } else {
             if (is_signed) {
-              builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
             } else {
-              builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+              GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
             }
-            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PhadddXRegXReg>(xn.machine_reg(), xn.machine_reg());
           }
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
           break;
         }
         case 0b10: {
@@ -10789,20 +10825,20 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           // lane-add, fold hi-qword to lo-qword.
           FpRegister xt = AllocTempSimdReg();
           if (is_signed) {
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PmovsxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
           } else {
-            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PmovzxdqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
           }
-          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xt.machine_reg(), xn.machine_reg(),
-                                                  static_cast<int8_t>(0xEE));
-          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+          GenRaw<x86_64::PshufdXRegXRegImm>(
+              xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xEE));
+          GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xt.machine_reg());
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
           break;
         }
         default:
@@ -10840,7 +10876,7 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       if (!args.q) {
         // Replicate low qword to high qword: { dw0, dw1, dw0, dw1 } via
         // _MM_SHUFFLE(1,0,1,0) = 0x44. Neutralizes the don't-care upper half.
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+        GenRaw<x86_64::PshufdXRegXRegImm>(
             xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x44));
       }
       auto EmitPmaxPmin = [&](unsigned width_bits) {
@@ -10848,40 +10884,40 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
           case 8:
             if (is_signed) {
               if (is_max)
-                builder_.Gen<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminsbXRegXReg>(xn.machine_reg(), xt.machine_reg());
             } else {
               if (is_max)
-                builder_.Gen<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxubXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminubXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminubXRegXReg>(xn.machine_reg(), xt.machine_reg());
             }
             break;
           case 16:
             if (is_signed) {
               if (is_max)
-                builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xt.machine_reg());
             } else {
               if (is_max)
-                builder_.Gen<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xt.machine_reg());
             }
             break;
           case 32:
             if (is_signed) {
               if (is_max)
-                builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xt.machine_reg());
             } else {
               if (is_max)
-                builder_.Gen<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PmaxudXRegXReg>(xn.machine_reg(), xt.machine_reg());
               else
-                builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xt.machine_reg());
+                GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xt.machine_reg());
             }
             break;
         }
@@ -10889,35 +10925,35 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       switch (args.size) {
         case 0b00: {
           // Bytes: 16 -> 8 -> 4 -> 2 -> 1 surviving lanes per step.
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
           EmitPmaxPmin(8);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
           EmitPmaxPmin(8);
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
+          GenRaw<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
           EmitPmaxPmin(8);
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{1});
+          GenRaw<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{1});
           EmitPmaxPmin(8);
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{15});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{15});
           break;
         }
         case 0b01: {
           // Halfwords: 8 -> 4 -> 2 -> 1 surviving lanes per step.
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
           EmitPmaxPmin(16);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
           EmitPmaxPmin(16);
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
+          GenRaw<x86_64::MovdqaXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrldqXRegImm>(xt.machine_reg(), int8_t{2});
           EmitPmaxPmin(16);
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
           break;
         }
         case 0b10: {
@@ -10926,14 +10962,14 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
             return;
           }
           // Dwords: 4 -> 2 -> 1 surviving lanes per step.
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
           EmitPmaxPmin(32);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(
+          GenRaw<x86_64::PshufdXRegXRegImm>(
               xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
           EmitPmaxPmin(32);
-          builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-          builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+          GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
           break;
         }
         default:
@@ -10987,19 +11023,19 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         // PSHUFD 0x4E swaps the 64-bit halves (folds lanes 2,3 into 0,1), 0xB1
         // swaps adjacent dwords (folds lane 1 into lane 0).
         FpRegister t0 = AllocTempSimdReg();
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+        GenRaw<x86_64::PshufdXRegXRegImm>(
             t0.machine_reg(), r.machine_reg(), static_cast<int8_t>(0x4E));
         r = EmitFpPairwiseMinMaxF32Packed(r, t0, h_is_max, h_is_nm);
         FpRegister t1 = AllocTempSimdReg();
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+        GenRaw<x86_64::PshufdXRegXRegImm>(
             t1.machine_reg(), r.machine_reg(), static_cast<int8_t>(0xB1));
         r = EmitFpPairwiseMinMaxF32Packed(r, t1, h_is_max, h_is_nm);
         // Keep lane 0 and zero the other three FP32 lanes before narrowing, so the
         // scalar store writes Hd with bits[127:16] clear: VCVTPS2PH turns the three
         // +0.0 lanes into 0x0000 halves and SetVRegScalar zeroes everything above
         // the low 32 bits.
-        builder_.Gen<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{12});
-        builder_.Gen<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{12});
+        GenRaw<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{12});
+        GenRaw<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{12});
         EmitNarrowF32ToHalfAndStore(args.rd, r);
         return;
       }
@@ -11015,16 +11051,16 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xt = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       // Step 1: fold lanes {2,3} into {0,1}. PSHUFD 0x4E swaps the 64-bit halves.
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
+      GenRaw<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
       xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Step 2: fold lane 1 into lane 0. PSHUFD 0xB1 swaps adjacent dwords.
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
+      GenRaw<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
       xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Keep only the low 32-bit result lane; zero the upper 96 bits.
-      builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+      GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
       builder_.GenSetSimd<16>(vd_off, xn.machine_reg());
       return;
     }
@@ -11049,25 +11085,25 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister x_eqmin = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       // 1. Primary truncating conversion.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
       // 2. NaN lanes -> 0.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
       // 3. INT32_MIN (0x80000000) per lane.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
       // 4. result == INT32_MIN ?
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
       // 5. src non-negative ? PSRAD 31 -> 0 if non-neg, all-1s if neg.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
       // 6. Flip INT_MIN -> INT_MAX in positive-overflow lanes.
-      builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
       SetVRegFull(args.rd, x_dst, args.q);
       return;
     }
@@ -11092,32 +11128,31 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister x_scratch = AllocZeroedSimdReg();
       builder_.GenGetSimd<16>(x_dst.machine_reg(), vn_off);
       // 1. Clamp neg/NaN to 0 via MAXPS with the zeroed scratch.
-      builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
       Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
-      builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
-          x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
+      GenRaw<x86_64::PshufdXRegXRegImm>(x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
       // 3. needs_offset = (2^31 <= src_clamped).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
       // 4. offset_amount = 2^31 where needs_offset.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
       // 5. src_for_cvt = src_clamped - offset_amount.
-      builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       // 6. too_big = (2^31 <= src_for_cvt).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
       // 7. CVTTPS2DQ.
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
       // 8. Build 0x80000000 per lane; AND needs_offset; OR into result.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
       // 9. Saturate too-big lanes to 0xFFFFFFFF.
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       SetVRegFull(args.rd, x_dst, args.q);
       return;
     }
@@ -11153,22 +11188,22 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister x_mask = AllocTempSimdReg();
       FpRegister x_eqmin = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
       // FCVTZS V saturation fix-up (Roundps preserves NaN/±Inf/sign-of-zero).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
       SetVRegFull(args.rd, x_dst, args.q);
       return;
     }
@@ -11201,34 +11236,33 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister x_needs_off = AllocTempSimdReg();
       FpRegister x_scratch = AllocZeroedSimdReg();
       builder_.GenGetSimd<16>(x_dst.machine_reg(), vn_off);
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(x_dst.machine_reg(), x_dst.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundpsXRegXRegImm>(x_dst.machine_reg(), x_dst.machine_reg(), round_imm);
       // 1. Clamp neg/NaN to 0 via MAXPS with the zeroed scratch.
-      builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
       Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
-      builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
-          x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
+      GenRaw<x86_64::PshufdXRegXRegImm>(x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
       // 3. needs_offset = (2^31 <= src_clamped).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
       // 4. offset_amount = 2^31 where needs_offset.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
       // 5. src_for_cvt = src_clamped - offset_amount.
-      builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       // 6. too_big = (2^31 <= src_for_cvt).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
       // 7. CVTTPS2DQ.
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
       // 8. Build 0x80000000 per lane; AND needs_offset; OR into result.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
       // 9. Saturate too-big lanes to 0xFFFFFFFF.
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       SetVRegFull(args.rd, x_dst, args.q);
       return;
     }
@@ -11257,42 +11291,45 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister abs_bits = AllocZeroedSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       // FRINTA dance (FP32 form).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(abs_bits.machine_reg(), abs_bits.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(abs_bits.machine_reg(), int8_t{1});   // 0x7FFFFFFF
-      builder_.Gen<x86_64::PandXRegXReg>(abs_bits.machine_reg(), xn.machine_reg());  // |bits|
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(copysign.machine_reg(), copysign.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(copysign.machine_reg(), int8_t{31});  // 0x80000000
-      builder_.Gen<x86_64::PandXRegXReg>(copysign.machine_reg(), xn.machine_reg());  // sign bit
+      GenRaw<x86_64::PcmpeqdXRegXReg>(abs_bits.machine_reg(), abs_bits.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(abs_bits.machine_reg(), int8_t{1});         // 0x7FFFFFFF
+      GenRaw<x86_64::PandXRegXReg>(abs_bits.machine_reg(), xn.machine_reg());  // |bits|
+      GenRaw<x86_64::PcmpeqdXRegXReg>(copysign.machine_reg(), copysign.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(copysign.machine_reg(), int8_t{31});        // 0x80000000
+      GenRaw<x86_64::PandXRegXReg>(copysign.machine_reg(), xn.machine_reg());  // sign bit
       Register gp_half = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x3F000000)));  // 0.5
-      builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), gp_half);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::PorXRegXReg>(copysign.machine_reg(), half.machine_reg());  // sign|0.5
+      GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), gp_half);
+      GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::PorXRegXReg>(copysign.machine_reg(), half.machine_reg());  // sign|0.5
       Register gp_pow = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4B000000)));  // 2^23
-      builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), gp_pow);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(half.machine_reg(), abs_bits.machine_reg());  // 1s where |x|<2^23
-      builder_.Gen<x86_64::PandXRegXReg>(copysign.machine_reg(), half.machine_reg());  // zero addend if int
-      builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), copysign.machine_reg());
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});  // trunc
+      GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), gp_pow);
+      GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::PcmpgtdXRegXReg>(half.machine_reg(),
+                                      abs_bits.machine_reg());  // 1s where |x|<2^23
+      GenRaw<x86_64::PandXRegXReg>(copysign.machine_reg(),
+                                   half.machine_reg());  // zero addend if int
+      GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), copysign.machine_reg());
+      GenRaw<x86_64::RoundpsXRegXRegImm>(
+          xn.machine_reg(), xn.machine_reg(), int8_t{0x03});  // trunc
       if (!is_unsigned) {
         // FCVTZS V .2S/.4S saturation fix-up.
         FpRegister x_dst = AllocTempSimdReg();
         FpRegister x_mask = AllocTempSimdReg();
         FpRegister x_eqmin = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-        builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+        GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+        GenRaw<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+        GenRaw<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
         SetVRegFull(args.rd, x_dst, args.q);
       } else {
         // FCVTZU V .2S/.4S saturation fix-up (offset-by-2^31 trick).
@@ -11300,25 +11337,25 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister x_pow31 = AllocTempSimdReg();
         FpRegister x_needs_off = AllocTempSimdReg();
         FpRegister x_scratch = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
         Register gp2 = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
-        builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp2);
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
+        GenRaw<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp2);
+        GenRaw<x86_64::PshufdXRegXRegImm>(
             x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
-        builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
-        builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-        builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
-        builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+        GenRaw<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+        GenRaw<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+        GenRaw<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+        GenRaw<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
         SetVRegFull(args.rd, x_dst, args.q);
       }
       return;
@@ -11347,21 +11384,21 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       if (!is_unsigned) {
         // SCVTF V: signed int32 -> FP32 is native.
-        builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
         SetVRegFull(args.rd, xn, args.q);
         return;
       }
       // UCVTF V: CVTDQ2PS + per-lane 2^32 addend for MSB-set lanes.
       FpRegister msb = AllocTempSimdReg();
       FpRegister addend = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});  // 0 or all-1s
-      builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
+      GenRaw<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});           // 0 or all-1s
+      GenRaw<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
       Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F800000)));  // 2^32
-      builder_.Gen<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());  // 2^32 where MSB set
-      builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
+      GenRaw<x86_64::PshufdXRegXRegImm>(addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());  // 2^32 where MSB set
+      GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
       SetVRegFull(args.rd, xn, args.q);
       return;
     }
@@ -11403,9 +11440,9 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         if (!host_platform::kHasF16C) { UndefinedReturningVoid(); return; }
         FpRegister lo = no_fp_register, hi = no_fp_register;
         EmitWidenHalfVec(vn_off, args.q, &lo, &hi);
-        builder_.Gen<x86_64::RoundpsXRegXRegImm>(lo.machine_reg(), lo.machine_reg(), round_imm);
+        GenRaw<x86_64::RoundpsXRegXRegImm>(lo.machine_reg(), lo.machine_reg(), round_imm);
         if (args.q)
-          builder_.Gen<x86_64::RoundpsXRegXRegImm>(hi.machine_reg(), hi.machine_reg(), round_imm);
+          GenRaw<x86_64::RoundpsXRegXRegImm>(hi.machine_reg(), hi.machine_reg(), round_imm);
         EmitNarrowHalfVecAndStore(args.rd, lo, hi, args.q);
         return;
       }
@@ -11415,7 +11452,7 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       }
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
+      GenRaw<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), round_imm);
       SetVRegFull(args.rd, xn, args.q);
       return;
     }
@@ -11446,17 +11483,17 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister lo = no_fp_register, hi = no_fp_register;
         EmitWidenHalfVec(vn_off, args.q, &lo, &hi);
         FpRegister smask = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PslldXRegImm>(smask.machine_reg(), int8_t{31});  // 0x80000000/dword
+        GenRaw<x86_64::PslldXRegImm>(smask.machine_reg(), int8_t{31});  // 0x80000000/dword
         FpRegister half = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+        GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
         auto rinta = [&](FpRegister x) {
           FpRegister t = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), smask.machine_reg());  // sign(x)
-          builder_.Gen<x86_64::PorXRegXReg>(t.machine_reg(), half.machine_reg());    // copysign(0.5,x)
-          builder_.Gen<x86_64::AddpsXRegXReg>(x.machine_reg(), t.machine_reg());
-          builder_.Gen<x86_64::RoundpsXRegXRegImm>(x.machine_reg(), x.machine_reg(), int8_t{0x03});
+          GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+          GenRaw<x86_64::PandXRegXReg>(t.machine_reg(), smask.machine_reg());  // sign(x)
+          GenRaw<x86_64::PorXRegXReg>(t.machine_reg(), half.machine_reg());    // copysign(0.5,x)
+          GenRaw<x86_64::AddpsXRegXReg>(x.machine_reg(), t.machine_reg());
+          GenRaw<x86_64::RoundpsXRegXRegImm>(x.machine_reg(), x.machine_reg(), int8_t{0x03});
         };
         rinta(lo);
         if (args.q) rinta(hi);
@@ -11474,22 +11511,22 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister thresh = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       // addend = copysign(0.5f, x) = (x & 0x80000000) | 0.5f, per lane.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(sign.machine_reg(), int8_t{31});  // 0x80000000
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), GetImm(uint64_t{0x3F000000}));  // 0.5f
+      GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::PorXRegXReg>(sign.machine_reg(), half.machine_reg());
       // gate = (|x| < 2^23) ? all-ones : 0, via thresh > |x| (signed PCMPGTD).
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
-      builder_.Gen<x86_64::PandXRegXReg>(absx.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(thresh.machine_reg(), thresh.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
-      builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), sign.machine_reg());
-      builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absx.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(absx.machine_reg(), int8_t{1});  // 0x7FFFFFFF
+      GenRaw<x86_64::PandXRegXReg>(absx.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(thresh.machine_reg(), GetImm(uint64_t{0x4B000000}));  // 2^23
+      GenRaw<x86_64::PshufdXRegXRegImm>(thresh.machine_reg(), thresh.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::PcmpgtdXRegXReg>(thresh.machine_reg(), absx.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), thresh.machine_reg());
+      GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});
       SetVRegFull(args.rd, xn, args.q);
       return;
     }
@@ -11538,59 +11575,59 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       switch (args.size) {
         case 0b00: {  // byte -> half
           if (is_signed) {
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsllwXRegImm>(xres.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PsrawXRegImm>(xres.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrawXRegImm>(xtmp.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsllwXRegImm>(xres.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PsrawXRegImm>(xres.machine_reg(), int8_t{8});
+            GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrawXRegImm>(xtmp.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           } else {
-            builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});  // 0x00FF
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});  // 0x00FF
+            GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PaddwXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           }
           break;
         }
         case 0b01: {  // half -> word
           if (is_signed) {
-            builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{15});  // 0x0001
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PmaddwdXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PsrlwXRegImm>(xtmp.machine_reg(), int8_t{15});  // 0x0001
+            GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PmaddwdXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           } else {
-            builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});  // 0x0000FFFF
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
-            builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});  // 0x0000FFFF
+            GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrldXRegImm>(xtmp.machine_reg(), int8_t{16});
+            GenRaw<x86_64::PadddXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           }
           break;
         }
         case 0b10: {  // word -> dword
           if (is_signed) {
             FpRegister xhi = AllocTempSimdReg();
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PmovsxdqXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xres.machine_reg());
-            builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xtmp.machine_reg(), xhi.machine_reg());
-            builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xres.machine_reg(), xhi.machine_reg());
-            builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PmovsxdqXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrldqXRegImm>(xhi.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PmovsxdqXRegXReg>(xhi.machine_reg(), xhi.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xres.machine_reg());
+            GenRaw<x86_64::PunpcklqdqXRegXReg>(xtmp.machine_reg(), xhi.machine_reg());
+            GenRaw<x86_64::PunpckhqdqXRegXReg>(xres.machine_reg(), xhi.machine_reg());
+            GenRaw<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           } else {
-            builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});  // lo dword mask
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
-            builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
-            builder_.Gen<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});
-            builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});  // lo dword mask
+            GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PandXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+            GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsrlqXRegImm>(xtmp.machine_reg(), int8_t{32});
+            GenRaw<x86_64::PaddqXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
           }
           break;
         }
@@ -11603,20 +11640,20 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PaddwXRegXReg>(xres.machine_reg(), xd.machine_reg());
+            GenRaw<x86_64::PaddwXRegXReg>(xres.machine_reg(), xd.machine_reg());
             break;
           case 0b01:
-            builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xd.machine_reg());
+            GenRaw<x86_64::PadddXRegXReg>(xres.machine_reg(), xd.machine_reg());
             break;
           default:
-            builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xd.machine_reg());
+            GenRaw<x86_64::PaddqXRegXReg>(xres.machine_reg(), xd.machine_reg());
             break;
         }
       }
       if (!args.q) {
         // mask_low64: zero the upper 64 bits (D-register semantics).
-        builder_.Gen<x86_64::PslldqXRegImm>(xres.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrldqXRegImm>(xres.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PslldqXRegImm>(xres.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xres.machine_reg(), int8_t{8});
       }
       builder_.GenSetSimd<16>(vd_off, xres.machine_reg());
       return;
@@ -11638,11 +11675,11 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
         FpRegister mask = AllocOnesSimdReg();
         if (is_fabs) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(mask.machine_reg(), int8_t{1});   // 0x7FFF/lane
-          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsrlwXRegImm>(mask.machine_reg(), int8_t{1});  // 0x7FFF/lane
+          GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
         } else {
-          builder_.Gen<x86_64::PsllwXRegImm>(mask.machine_reg(), int8_t{15});  // 0x8000/lane
-          builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PsllwXRegImm>(mask.machine_reg(), int8_t{15});  // 0x8000/lane
+          GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
         }
         SetVRegFull(args.rd, xn, args.q);
         return;
@@ -11655,18 +11692,18 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister mask = AllocOnesSimdReg();
       if (is_fabs) {
         if (is_double) {
-          builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
         } else {
-          builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
         }
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
       } else {
         if (is_double) {
-          builder_.Gen<x86_64::PsllqXRegImm>(mask.machine_reg(), int8_t{63});
+          GenRaw<x86_64::PsllqXRegImm>(mask.machine_reg(), int8_t{63});
         } else {
-          builder_.Gen<x86_64::PslldXRegImm>(mask.machine_reg(), int8_t{31});
+          GenRaw<x86_64::PslldXRegImm>(mask.machine_reg(), int8_t{31});
         }
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), mask.machine_reg());
       }
       // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xn, args.q);
@@ -11684,8 +11721,8 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         if (!host_platform::kHasF16C) { UndefinedReturningVoid(); return; }
         FpRegister lo = no_fp_register, hi = no_fp_register;
         EmitWidenHalfVec(vn_off, args.q, &lo, &hi);
-        builder_.Gen<x86_64::SqrtpsXRegXReg>(lo.machine_reg(), lo.machine_reg());
-        if (args.q) builder_.Gen<x86_64::SqrtpsXRegXReg>(hi.machine_reg(), hi.machine_reg());
+        GenRaw<x86_64::SqrtpsXRegXReg>(lo.machine_reg(), lo.machine_reg());
+        if (args.q) GenRaw<x86_64::SqrtpsXRegXReg>(hi.machine_reg(), hi.machine_reg());
         EmitNarrowHalfVecAndStore(args.rd, lo, hi, args.q);
         return;
       }
@@ -11696,9 +11733,9 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       FpRegister res = AllocTempSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::SqrtpdXRegXReg>(res.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::SqrtpdXRegXReg>(res.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::SqrtpsXRegXReg>(res.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::SqrtpsXRegXReg>(res.machine_reg(), xn.machine_reg());
       }
       // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, res, args.q);
@@ -11715,10 +11752,10 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       if (args.q) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
       }
       FpRegister res = AllocTempSimdReg();
-      builder_.Gen<x86_64::Cvtps2pdXRegXReg>(res.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvtps2pdXRegXReg>(res.machine_reg(), xn.machine_reg());
       builder_.GenSetSimd<16>(GetVRegOffset(args.rd), res.machine_reg());
       return;
     }
@@ -11734,18 +11771,18 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       FpRegister res = AllocTempSimdReg();
-      builder_.Gen<x86_64::Cvtpd2psXRegXReg>(res.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvtpd2psXRegXReg>(res.machine_reg(), xn.machine_reg());
       if (!args.q) {
         builder_.GenSetSimd<16>(vd_off, res.machine_reg());
       } else {
         // FCVTN2: shift the 2 floats into the high 64, keep Vd's low 64.
-        builder_.Gen<x86_64::PslldqXRegImm>(res.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PslldqXRegImm>(res.machine_reg(), int8_t{8});
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         // Keep Vd's low 64, zero its high 64 (PSLLDQ 8 then PSRLDQ 8).
-        builder_.Gen<x86_64::PslldqXRegImm>(xd.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PorXRegXReg>(res.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PslldqXRegImm>(xd.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xd.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PorXRegXReg>(res.machine_reg(), xd.machine_reg());
         builder_.GenSetSimd<16>(vd_off, res.machine_reg());
       }
       return;
@@ -11777,30 +11814,30 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
 
       // n = CVTPD2PS(x) (RNE);  back = CVTPS2PD(n) (exact widen).
       FpRegister n = AllocTempSimdReg();
-      builder_.Gen<x86_64::Cvtpd2psXRegXReg>(n.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvtpd2psXRegXReg>(n.machine_reg(), xn.machine_reg());
       FpRegister back = AllocTempSimdReg();
-      builder_.Gen<x86_64::Cvtps2pdXRegXReg>(back.machine_reg(), n.machine_reg());
+      GenRaw<x86_64::Cvtps2pdXRegXReg>(back.machine_reg(), n.machine_reg());
 
       // force64 = (NOT (back==x)) AND (x==x)  -> finite-AND-inexact, per 64-bit lane.
       FpRegister force = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(force.machine_reg(), back.machine_reg());
-      builder_.Gen<x86_64::CmpeqpdXRegXReg>(force.machine_reg(), xn.machine_reg());  // back==x
+      GenRaw<x86_64::MovdqaXRegXReg>(force.machine_reg(), back.machine_reg());
+      GenRaw<x86_64::CmpeqpdXRegXReg>(force.machine_reg(), xn.machine_reg());  // back==x
       FpRegister ord = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(ord.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::CmpeqpdXRegXReg>(ord.machine_reg(), xn.machine_reg());  // x==x
-      builder_.Gen<x86_64::PandnXRegXReg>(force.machine_reg(), ord.machine_reg());  // ~force & ord
+      GenRaw<x86_64::MovdqaXRegXReg>(ord.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::CmpeqpdXRegXReg>(ord.machine_reg(), xn.machine_reg());   // x==x
+      GenRaw<x86_64::PandnXRegXReg>(force.machine_reg(), ord.machine_reg());  // ~force & ord
 
       // over64 = |x| < |back|  (RNE rounded away from zero), per 64-bit lane.
       FpRegister absm = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(absm.machine_reg(), absm.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(absm.machine_reg(), int8_t{1});  // 0x7FFF..F/qword
+      GenRaw<x86_64::PcmpeqdXRegXReg>(absm.machine_reg(), absm.machine_reg());
+      GenRaw<x86_64::PsrlqXRegImm>(absm.machine_reg(), int8_t{1});  // 0x7FFF..F/qword
       FpRegister over = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(over.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(over.machine_reg(), absm.machine_reg());  // |x|
+      GenRaw<x86_64::MovdqaXRegXReg>(over.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(over.machine_reg(), absm.machine_reg());  // |x|
       FpRegister aback = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(aback.machine_reg(), back.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(aback.machine_reg(), absm.machine_reg());  // |back|
-      builder_.Gen<x86_64::CmpltpdXRegXReg>(over.machine_reg(), aback.machine_reg());  // |x|<|back|
+      GenRaw<x86_64::MovdqaXRegXReg>(aback.machine_reg(), back.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(aback.machine_reg(), absm.machine_reg());     // |back|
+      GenRaw<x86_64::CmpltpdXRegXReg>(over.machine_reg(), aback.machine_reg());  // |x|<|back|
 
       // Collapse both 64-bit lane masks to 32-bit dword masks aligned with n's two low
       // floats: PSHUFD 0x08 moves src dwords {0,2} into dwords {0,1}.
@@ -11812,40 +11849,40 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       // Per-dword constant masks from an all-ones reg (self-Pcmpeq off a zeroed reg to
       // satisfy the use-before-def lifetime check).
       FpRegister ones = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(ones.machine_reg(), ones.machine_reg());
       FpRegister signm = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(signm.machine_reg(), ones.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(signm.machine_reg(), int8_t{31});  // 0x80000000/dword
+      GenRaw<x86_64::MovdqaXRegXReg>(signm.machine_reg(), ones.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(signm.machine_reg(), int8_t{31});  // 0x80000000/dword
       FpRegister magm = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(magm.machine_reg(), ones.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(magm.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
+      GenRaw<x86_64::MovdqaXRegXReg>(magm.machine_reg(), ones.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(magm.machine_reg(), int8_t{1});  // 0x7FFFFFFF/dword
       FpRegister onem = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(onem.machine_reg(), ones.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(onem.machine_reg(), int8_t{31});  // 0x00000001/dword
+      GenRaw<x86_64::MovdqaXRegXReg>(onem.machine_reg(), ones.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(onem.machine_reg(), int8_t{31});  // 0x00000001/dword
 
       // sign = n & 0x80000000 ; mag = n & 0x7FFFFFFF.
       FpRegister sign = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(sign.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sign.machine_reg(), signm.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(sign.machine_reg(), n.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sign.machine_reg(), signm.machine_reg());
       FpRegister mag = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mag.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(mag.machine_reg(), magm.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mag.machine_reg(), n.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(mag.machine_reg(), magm.machine_reg());
 
       // dec = (over & force) & 1 -> step to the round-toward-zero neighbor.
       FpRegister dec = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(dec.machine_reg(), over32.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(dec.machine_reg(), force32.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(dec.machine_reg(), onem.machine_reg());
-      builder_.Gen<x86_64::PsubdXRegXReg>(mag.machine_reg(), dec.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(dec.machine_reg(), over32.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(dec.machine_reg(), force32.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(dec.machine_reg(), onem.machine_reg());
+      GenRaw<x86_64::PsubdXRegXReg>(mag.machine_reg(), dec.machine_reg());
 
       // orb = force & 1 -> round-to-odd (force LSB on inexact finite lanes).
       FpRegister orb = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(orb.machine_reg(), force32.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(orb.machine_reg(), onem.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(mag.machine_reg(), orb.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(orb.machine_reg(), force32.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(orb.machine_reg(), onem.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(mag.machine_reg(), orb.machine_reg());
 
       // result = sign | mag (reconstructs n exactly for untouched lanes).
-      builder_.Gen<x86_64::PorXRegXReg>(mag.machine_reg(), sign.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(mag.machine_reg(), sign.machine_reg());
 
       SetVRegNarrow(args.rd, mag, args.q);
       return;
@@ -11871,22 +11908,18 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       // recip = broadcast(1.0).
       FpRegister recip = AllocTempSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::MovqXRegReg>(
-            recip.machine_reg(), GetImm(uint64_t{0x3FF0000000000000}));
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
-            recip.machine_reg(), recip.machine_reg(), int8_t{0x44});
+        GenRaw<x86_64::MovqXRegReg>(recip.machine_reg(), GetImm(uint64_t{0x3FF0000000000000}));
+        GenRaw<x86_64::PshufdXRegXRegImm>(recip.machine_reg(), recip.machine_reg(), int8_t{0x44});
       } else {
-        builder_.Gen<x86_64::MovdXRegReg>(
-            recip.machine_reg(), GetImm(uint64_t{0x3F800000}));
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
-            recip.machine_reg(), recip.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::MovdXRegReg>(recip.machine_reg(), GetImm(uint64_t{0x3F800000}));
+        GenRaw<x86_64::PshufdXRegXRegImm>(recip.machine_reg(), recip.machine_reg(), int8_t{0x00});
       }
       if (!is_rsqrt) {
         // FRECPE: recip = 1.0 / src.
         if (is_double) {
-          builder_.Gen<x86_64::DivpdXRegXReg>(recip.machine_reg(), src.machine_reg());
+          GenRaw<x86_64::DivpdXRegXReg>(recip.machine_reg(), src.machine_reg());
         } else {
-          builder_.Gen<x86_64::DivpsXRegXReg>(recip.machine_reg(), src.machine_reg());
+          GenRaw<x86_64::DivpsXRegXReg>(recip.machine_reg(), src.machine_reg());
         }
         SetVRegFull(args.rd, recip, args.q);
         return;
@@ -11894,45 +11927,39 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       // FRSQRTE: recip = 1.0 / sqrt(src), then blend qNaN where src<=0 || NaN.
       FpRegister sq = AllocTempSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::SqrtpdXRegXReg>(sq.machine_reg(), src.machine_reg());
-        builder_.Gen<x86_64::DivpdXRegXReg>(recip.machine_reg(), sq.machine_reg());
+        GenRaw<x86_64::SqrtpdXRegXReg>(sq.machine_reg(), src.machine_reg());
+        GenRaw<x86_64::DivpdXRegXReg>(recip.machine_reg(), sq.machine_reg());
       } else {
-        builder_.Gen<x86_64::SqrtpsXRegXReg>(sq.machine_reg(), src.machine_reg());
-        builder_.Gen<x86_64::DivpsXRegXReg>(recip.machine_reg(), sq.machine_reg());
+        GenRaw<x86_64::SqrtpsXRegXReg>(sq.machine_reg(), src.machine_reg());
+        GenRaw<x86_64::DivpsXRegXReg>(recip.machine_reg(), sq.machine_reg());
       }
       // mask = (src <= 0) | isNaN(src).
       FpRegister zero = AllocZeroedSimdReg();
       FpRegister mask = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mask.machine_reg(), src.machine_reg());
       FpRegister nan_mask = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(nan_mask.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(nan_mask.machine_reg(), src.machine_reg());
       if (is_double) {
-        builder_.Gen<x86_64::CmplepdXRegXReg>(mask.machine_reg(), zero.machine_reg());
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(
-            nan_mask.machine_reg(), nan_mask.machine_reg());
+        GenRaw<x86_64::CmplepdXRegXReg>(mask.machine_reg(), zero.machine_reg());
+        GenRaw<x86_64::CmpunordpdXRegXReg>(nan_mask.machine_reg(), nan_mask.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmplepsXRegXReg>(mask.machine_reg(), zero.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(
-            nan_mask.machine_reg(), nan_mask.machine_reg());
+        GenRaw<x86_64::CmplepsXRegXReg>(mask.machine_reg(), zero.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(nan_mask.machine_reg(), nan_mask.machine_reg());
       }
-      builder_.Gen<x86_64::PorXRegXReg>(mask.machine_reg(), nan_mask.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(mask.machine_reg(), nan_mask.machine_reg());
       // qnan = broadcast(default qNaN).
       FpRegister qnan = AllocTempSimdReg();
       if (is_double) {
-        builder_.Gen<x86_64::MovqXRegReg>(
-            qnan.machine_reg(), GetImm(uint64_t{0x7FF8000000000000}));
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
-            qnan.machine_reg(), qnan.machine_reg(), int8_t{0x44});
+        GenRaw<x86_64::MovqXRegReg>(qnan.machine_reg(), GetImm(uint64_t{0x7FF8000000000000}));
+        GenRaw<x86_64::PshufdXRegXRegImm>(qnan.machine_reg(), qnan.machine_reg(), int8_t{0x44});
       } else {
-        builder_.Gen<x86_64::MovdXRegReg>(
-            qnan.machine_reg(), GetImm(uint64_t{0x7FC00000}));
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(
-            qnan.machine_reg(), qnan.machine_reg(), int8_t{0x00});
+        GenRaw<x86_64::MovdXRegReg>(qnan.machine_reg(), GetImm(uint64_t{0x7FC00000}));
+        GenRaw<x86_64::PshufdXRegXRegImm>(qnan.machine_reg(), qnan.machine_reg(), int8_t{0x00});
       }
       // result = (mask & qnan) | (~mask & recip).
-      builder_.Gen<x86_64::PandXRegXReg>(qnan.machine_reg(), mask.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(mask.machine_reg(), recip.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(qnan.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(qnan.machine_reg(), mask.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(mask.machine_reg(), recip.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(qnan.machine_reg(), mask.machine_reg());
       SetVRegFull(args.rd, qnan, args.q);
       return;
     }
@@ -11958,13 +11985,13 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         // SQNEG: res = 0 - xn.
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg());
             break;
           case 0b01:
-            builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg());
             break;
           default:
-            builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg());
             break;
         }
       } else {
@@ -11972,26 +11999,26 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         FpRegister sign = AllocZeroedSimdReg();
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PcmpgtbXRegXReg>(sign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtbXRegXReg>(sign.machine_reg(), xn.machine_reg());
             break;
           case 0b01:
-            builder_.Gen<x86_64::PcmpgtwXRegXReg>(sign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtwXRegXReg>(sign.machine_reg(), xn.machine_reg());
             break;
           default:
-            builder_.Gen<x86_64::PcmpgtdXRegXReg>(sign.machine_reg(), xn.machine_reg());
+            GenRaw<x86_64::PcmpgtdXRegXReg>(sign.machine_reg(), xn.machine_reg());
             break;
         }
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xres.machine_reg(), sign.machine_reg());
         switch (args.size) {
           case 0b00:
-            builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), sign.machine_reg());
+            GenRaw<x86_64::PsubbXRegXReg>(xres.machine_reg(), sign.machine_reg());
             break;
           case 0b01:
-            builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), sign.machine_reg());
+            GenRaw<x86_64::PsubwXRegXReg>(xres.machine_reg(), sign.machine_reg());
             break;
           default:
-            builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), sign.machine_reg());
+            GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), sign.machine_reg());
             break;
         }
       }
@@ -12003,23 +12030,21 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
       }
       FpRegister xmin = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdXRegReg>(
-          xmin.machine_reg(),
-          GetImm(static_cast<uint64_t>(static_cast<uint32_t>(int_min_bcast))));
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
-          xmin.machine_reg(), xmin.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdXRegReg>(
+          xmin.machine_reg(), GetImm(static_cast<uint64_t>(static_cast<uint32_t>(int_min_bcast))));
+      GenRaw<x86_64::PshufdXRegXRegImm>(xmin.machine_reg(), xmin.machine_reg(), int8_t{0x00});
       switch (args.size) {
         case 0b00:
-          builder_.Gen<x86_64::PcmpeqbXRegXReg>(xmin.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpeqbXRegXReg>(xmin.machine_reg(), xn.machine_reg());
           break;
         case 0b01:
-          builder_.Gen<x86_64::PcmpeqwXRegXReg>(xmin.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpeqwXRegXReg>(xmin.machine_reg(), xn.machine_reg());
           break;
         default:
-          builder_.Gen<x86_64::PcmpeqdXRegXReg>(xmin.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpeqdXRegXReg>(xmin.machine_reg(), xn.machine_reg());
           break;
       }
-      builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xmin.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xres.machine_reg(), xmin.machine_reg());
       // Q=0 zeroes Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xres, args.q);
       return;
@@ -12052,8 +12077,7 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         idx = std::get<0>(Gen<x86_64::AndlRegImm>(idx, int32_t{0x1FF}));
         Register val = std::get<0>(Gen<x86_64::MovlRegOp>(x86_64::MemoryOperand{
             .base = tbl, .index = idx, .scale = x86_64::Assembler::kTimesFour}));
-        builder_.Gen<x86_64::PinsrdXRegRegImm>(
-            xres.machine_reg(), val, static_cast<int8_t>(i));
+        GenRaw<x86_64::PinsrdXRegRegImm>(xres.machine_reg(), val, static_cast<int8_t>(i));
       }
       // Q=0 (.2S) writes low 64, upper zeroed (xres started zeroed anyway).
       SetVRegFull(args.rd, xres, args.q);
@@ -12106,8 +12130,8 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     // Scrub to lane 0: keep the low (2<<size) source bytes, zero everything
     // above (PSLLDQ N + PSRLDQ N, N = 16 - src_bytes).
     const int8_t scrub = static_cast<int8_t>(16 - (2 << args.size));  // 14,12,8
-    builder_.Gen<x86_64::PslldqXRegImm>(x.machine_reg(), scrub);
-    builder_.Gen<x86_64::PsrldqXRegImm>(x.machine_reg(), scrub);
+    GenRaw<x86_64::PslldqXRegImm>(x.machine_reg(), scrub);
+    GenRaw<x86_64::PsrldqXRegImm>(x.machine_reg(), scrub);
     if (args.size == 0b10) {
       // 64->32: no 64->32 x86 pack, so clamp each 64-bit lane into the
       // destination range with PCMPGTQ/PCMPEQQ masked blends and gather the
@@ -12115,56 +12139,55 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
       // path. The scrubbed lane 1 is 0 -> clamp(0)=0 -> gathered dword=0.
       auto set_const = [&](FpRegister r, int64_t v) {
         Register gp = std::get<0>(Gen<x86_64::MovqRegImm>(v));
-        builder_.Gen<x86_64::MovqXRegReg>(r.machine_reg(), gp);
-        builder_.Gen<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(r.machine_reg(), gp);
+        GenRaw<x86_64::PunpcklqdqXRegXReg>(r.machine_reg(), r.machine_reg());
       };
       // x = (x & ~mask) | (val & mask), via x ^= (x ^ val) & mask.
       auto blend = [&](FpRegister val, FpRegister mask) {
         FpRegister t = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t.machine_reg(), val.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(t.machine_reg(), mask.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(x.machine_reg(), t.machine_reg());
       };
       if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtn) {
         FpRegister c = AllocTempSimdReg();
         FpRegister m = AllocTempSimdReg();
         set_const(c, int64_t{0x000000007FFFFFFFLL});  // INT32_MAX
-        builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
+        GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > MAX
         blend(c, m);
         set_const(c, static_cast<int64_t>(0xFFFFFFFF80000000ULL));  // INT32_MIN
-        builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
+        GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), c.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < MIN
         blend(c, m);
       } else if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
         FpRegister c = AllocTempSimdReg();
         FpRegister m = AllocTempSimdReg();
         set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
-        builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
+        GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), c.machine_reg());  // x > UMAX
         blend(c, m);
         FpRegister z = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
-        builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());     // neg -> 0
-        builder_.Gen<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), z.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(m.machine_reg(), x.machine_reg());  // x < 0
+        GenRaw<x86_64::PandnXRegXReg>(m.machine_reg(), x.machine_reg());    // neg -> 0
+        GenRaw<x86_64::MovdqaXRegXReg>(x.machine_reg(), m.machine_reg());
       } else {  // kUqxtn: unsigned uint64 -> clamp to UINT32_MAX
         FpRegister c = AllocTempSimdReg();
         FpRegister m = AllocTempSimdReg();
         set_const(c, int64_t{0x00000000FFFFFFFFLL});  // UINT32_MAX
-        builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
+        GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::PsrlqXRegImm>(m.machine_reg(), int8_t{32});  // high 32 bits
         FpRegister z = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
+        GenRaw<x86_64::PcmpeqqXRegXReg>(m.machine_reg(), z.machine_reg());  // high32==0
         FpRegister t = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), x.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t.machine_reg(), c.machine_reg());
+        GenRaw<x86_64::PandnXRegXReg>(m.machine_reg(), t.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(x.machine_reg(), m.machine_reg());
       }
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(),
-                                              int8_t{0b00001000});
+      GenRaw<x86_64::PshufdXRegXRegImm>(x.machine_reg(), x.machine_reg(), int8_t{0b00001000});
       SetVRegNarrow(args.rd, x, /*q=*/false);
       return;
     }
@@ -12175,26 +12198,26 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
       Register mlo = std::get<0>(Gen<x86_64::MovqRegImm>(
           args.size == 0b00 ? int64_t{0x00FF00FF00FF00FFLL}
                             : int64_t{0x0000FFFF0000FFFFLL}));
-      builder_.Gen<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
-      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(xm.machine_reg(), mlo);
+      GenRaw<x86_64::PunpcklqdqXRegXReg>(xm.machine_reg(), xm.machine_reg());
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PminuwXRegXReg>(x.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PminuwXRegXReg>(x.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
       } else {
-        builder_.Gen<x86_64::PminudXRegXReg>(x.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PminudXRegXReg>(x.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
       }
     } else if (opc == Decoder::AdvSimdScalarTwoRegMiscOpcode::kSqxtun) {
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PackuswbXRegXReg>(x.machine_reg(), xz.machine_reg());
       } else {
-        builder_.Gen<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PackusdwXRegXReg>(x.machine_reg(), xz.machine_reg());
       }
     } else {  // kSqxtn
       if (args.size == 0b00) {
-        builder_.Gen<x86_64::PacksswbXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PacksswbXRegXReg>(x.machine_reg(), xz.machine_reg());
       } else {
-        builder_.Gen<x86_64::PackssdwXRegXReg>(x.machine_reg(), xz.machine_reg());
+        GenRaw<x86_64::PackssdwXRegXReg>(x.machine_reg(), xz.machine_reg());
       }
     }
     SetVRegNarrow(args.rd, x, /*q=*/false);
@@ -12224,8 +12247,8 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     // Scrub to lane 0: keep the low (1<<size) bytes, zero everything above,
     // so lanes 1.. hold the integer 0.
     const int8_t scrub = static_cast<int8_t>(16 - (1 << args.size));  // 15,14,12
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
     FpRegister xres = AllocTempSimdReg();
     // xtmp is defined below by MovD (INT_MIN broadcast) — no self-op on a
     // fresh temp; the branches use AllocZeroedSimdReg for their zero source
@@ -12234,27 +12257,44 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     if (is_neg) {
       // SQNEG: res = 0 - xn (packed).  xres starts at zero (copied from a
       // zeroed reg so the def is a MOVDQA, not a use-before-def self-PXOR).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(),
-                                           AllocZeroedSimdReg().machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), AllocZeroedSimdReg().machine_reg());
       switch (args.size) {
-        case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
-        case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
-        default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg()); break;
+        case 0b00:
+          GenRaw<x86_64::PsubbXRegXReg>(xres.machine_reg(), xn.machine_reg());
+          break;
+        case 0b01:
+          GenRaw<x86_64::PsubwXRegXReg>(xres.machine_reg(), xn.machine_reg());
+          break;
+        default:
+          GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), xn.machine_reg());
+          break;
       }
     } else {
       // SQABS: sign = PCMPGT(0, xn); res = (xn ^ sign) - sign = |xn|.
       FpRegister xsign = AllocZeroedSimdReg();
       switch (args.size) {
-        case 0b00: builder_.Gen<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
-        case 0b01: builder_.Gen<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
-        default:   builder_.Gen<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg()); break;
+        case 0b00:
+          GenRaw<x86_64::PcmpgtbXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+          break;
+        case 0b01:
+          GenRaw<x86_64::PcmpgtwXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+          break;
+        default:
+          GenRaw<x86_64::PcmpgtdXRegXReg>(xsign.machine_reg(), xn.machine_reg());
+          break;
       }
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xres.machine_reg(), xsign.machine_reg());
       switch (args.size) {
-        case 0b00: builder_.Gen<x86_64::PsubbXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
-        case 0b01: builder_.Gen<x86_64::PsubwXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
-        default:   builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xsign.machine_reg()); break;
+        case 0b00:
+          GenRaw<x86_64::PsubbXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+          break;
+        case 0b01:
+          GenRaw<x86_64::PsubwXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+          break;
+        default:
+          GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), xsign.machine_reg());
+          break;
       }
     }
     // Saturation: INT_MIN lanes still hold INT_MIN (0x80..0) after abs/neg;
@@ -12269,14 +12309,20 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
       default:   int_min_bcast = static_cast<int32_t>(0x80000000u); break;
     }
     Register gp_min = std::get<0>(Gen<x86_64::MovlRegImm>(int_min_bcast));
-    builder_.Gen<x86_64::MovdXRegReg>(xtmp.machine_reg(), gp_min);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xtmp.machine_reg(), xtmp.machine_reg(), int8_t{0x00});
+    GenRaw<x86_64::MovdXRegReg>(xtmp.machine_reg(), gp_min);
+    GenRaw<x86_64::PshufdXRegXRegImm>(xtmp.machine_reg(), xtmp.machine_reg(), int8_t{0x00});
     switch (args.size) {
-      case 0b00: builder_.Gen<x86_64::PcmpeqbXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
-      case 0b01: builder_.Gen<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
-      default:   builder_.Gen<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xn.machine_reg()); break;
+      case 0b00:
+        GenRaw<x86_64::PcmpeqbXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+        break;
+      case 0b01:
+        GenRaw<x86_64::PcmpeqwXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+        break;
+      default:
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xtmp.machine_reg(), xn.machine_reg());
+        break;
     }
-    builder_.Gen<x86_64::PxorXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xres.machine_reg(), xtmp.machine_reg());
     SetVRegFull(args.rd, xres, /*q=*/false);
     return;
   }
@@ -12304,45 +12350,46 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     FpRegister abs_bits = AllocZeroedSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off_a);
     // Scrub to lane 0: keep the low 32 bits (the scalar float), zero bytes [15:4].
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
     // FRINTA dance (FP32 form).
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(abs_bits.machine_reg(), abs_bits.machine_reg());
-    builder_.Gen<x86_64::PsrldXRegImm>(abs_bits.machine_reg(), int8_t{1});   // 0x7FFFFFFF
-    builder_.Gen<x86_64::PandXRegXReg>(abs_bits.machine_reg(), xn.machine_reg());  // |bits|
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(copysign.machine_reg(), copysign.machine_reg());
-    builder_.Gen<x86_64::PslldXRegImm>(copysign.machine_reg(), int8_t{31});  // 0x80000000
-    builder_.Gen<x86_64::PandXRegXReg>(copysign.machine_reg(), xn.machine_reg());  // sign bit
+    GenRaw<x86_64::PcmpeqdXRegXReg>(abs_bits.machine_reg(), abs_bits.machine_reg());
+    GenRaw<x86_64::PsrldXRegImm>(abs_bits.machine_reg(), int8_t{1});         // 0x7FFFFFFF
+    GenRaw<x86_64::PandXRegXReg>(abs_bits.machine_reg(), xn.machine_reg());  // |bits|
+    GenRaw<x86_64::PcmpeqdXRegXReg>(copysign.machine_reg(), copysign.machine_reg());
+    GenRaw<x86_64::PslldXRegImm>(copysign.machine_reg(), int8_t{31});        // 0x80000000
+    GenRaw<x86_64::PandXRegXReg>(copysign.machine_reg(), xn.machine_reg());  // sign bit
     Register gp_half = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x3F000000)));  // 0.5
-    builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), gp_half);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
-    builder_.Gen<x86_64::PorXRegXReg>(copysign.machine_reg(), half.machine_reg());  // sign|0.5
+    GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), gp_half);
+    GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+    GenRaw<x86_64::PorXRegXReg>(copysign.machine_reg(), half.machine_reg());  // sign|0.5
     Register gp_pow = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4B000000)));  // 2^23
-    builder_.Gen<x86_64::MovdXRegReg>(half.machine_reg(), gp_pow);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
-    builder_.Gen<x86_64::PcmpgtdXRegXReg>(half.machine_reg(), abs_bits.machine_reg());  // 1s where |x|<2^23
-    builder_.Gen<x86_64::PandXRegXReg>(copysign.machine_reg(), half.machine_reg());  // zero addend if int
-    builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), copysign.machine_reg());
-    builder_.Gen<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});  // trunc
+    GenRaw<x86_64::MovdXRegReg>(half.machine_reg(), gp_pow);
+    GenRaw<x86_64::PshufdXRegXRegImm>(half.machine_reg(), half.machine_reg(), int8_t{0x00});
+    GenRaw<x86_64::PcmpgtdXRegXReg>(half.machine_reg(),
+                                    abs_bits.machine_reg());                   // 1s where |x|<2^23
+    GenRaw<x86_64::PandXRegXReg>(copysign.machine_reg(), half.machine_reg());  // zero addend if int
+    GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), copysign.machine_reg());
+    GenRaw<x86_64::RoundpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), int8_t{0x03});  // trunc
     if (!is_unsigned) {
       // FCVTZS .2S/.4S saturation fix-up.
       FpRegister x_dst = AllocTempSimdReg();
       FpRegister x_mask = AllocTempSimdReg();
       FpRegister x_eqmin = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
       SetVRegFull(args.rd, x_dst, /*q=*/false);
     } else {
       // FCVTZU .2S/.4S saturation fix-up (offset-by-2^31 trick).
@@ -12350,25 +12397,24 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
       FpRegister x_pow31 = AllocTempSimdReg();
       FpRegister x_needs_off = AllocTempSimdReg();
       FpRegister x_scratch = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       Register gp2 = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
-      builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp2);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(
-          x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
-      builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp2);
+      GenRaw<x86_64::PshufdXRegXRegImm>(x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+      GenRaw<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
       SetVRegFull(args.rd, x_dst, /*q=*/false);
     }
     return;
@@ -12417,27 +12463,26 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     FpRegister xn = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     // Scrub to lane 0: keep the low 32 bits (the scalar int), zero bytes [15:4].
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
     if (is_scvtf) {
       // SCVTF: signed int32 -> FP32 is native.
-      builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());
       SetVRegFull(args.rd, xn, /*q=*/false);
       return;
     }
     // UCVTF: CVTDQ2PS + per-lane 2^32 addend for MSB-set lanes.
     FpRegister msb = AllocTempSimdReg();
     FpRegister addend = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});  // 0 or all-1s
-    builder_.Gen<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
+    GenRaw<x86_64::MovdqaXRegXReg>(msb.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PsradXRegImm>(msb.machine_reg(), int8_t{31});           // 0 or all-1s
+    GenRaw<x86_64::Cvtdq2psXRegXReg>(xn.machine_reg(), xn.machine_reg());  // signed convert
     Register gp =
         std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F800000)));  // 2^32
-    builder_.Gen<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(
-        addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
-    builder_.Gen<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());
-    builder_.Gen<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
+    GenRaw<x86_64::MovdXRegReg>(addend.machine_reg(), gp);
+    GenRaw<x86_64::PshufdXRegXRegImm>(addend.machine_reg(), addend.machine_reg(), int8_t{0x00});
+    GenRaw<x86_64::PandXRegXReg>(addend.machine_reg(), msb.machine_reg());
+    GenRaw<x86_64::AddpsXRegXReg>(xn.machine_reg(), addend.machine_reg());
     SetVRegFull(args.rd, xn, /*q=*/false);
     return;
   }
@@ -12451,28 +12496,28 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
     FpRegister x_eqmin = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
     // 1. Primary truncating conversion.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
     // 2. NaN lanes -> 0.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::CmpunordpsXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_dst.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
     // 3. INT32_MIN (0x80000000) per lane.
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
-    builder_.Gen<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
+    GenRaw<x86_64::PcmpeqdXRegXReg>(x_mask.machine_reg(), x_mask.machine_reg());
+    GenRaw<x86_64::PslldXRegImm>(x_mask.machine_reg(), int8_t{31});
     // 4. result == INT32_MIN ?
-    builder_.Gen<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(x_eqmin.machine_reg(), x_dst.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(x_eqmin.machine_reg(), x_mask.machine_reg());
     // 5. src non-negative ? PSRAD 31 -> 0 if non-neg, all-1s if neg.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
-    builder_.Gen<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(x_mask.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PsradXRegImm>(x_mask.machine_reg(), int8_t{31});
+    GenRaw<x86_64::PandnXRegXReg>(x_mask.machine_reg(), x_eqmin.machine_reg());
     // 6. Flip INT_MIN -> INT_MAX in positive-overflow lanes.
-    builder_.Gen<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(x_dst.machine_reg(), x_mask.machine_reg());
     SetVRegFull(args.rd, x_dst, /*q=*/false);
     return;
   }
@@ -12484,35 +12529,34 @@ void HeavyOptimizerFrontend::AdvSimdScalarTwoRegMisc(const Decoder::AdvSimdScala
   FpRegister x_scratch = AllocZeroedSimdReg();
   builder_.GenGetSimd<16>(x_dst.machine_reg(), vn_off);
   // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
-  builder_.Gen<x86_64::PslldqXRegImm>(x_dst.machine_reg(), int8_t{12});
-  builder_.Gen<x86_64::PsrldqXRegImm>(x_dst.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PslldqXRegImm>(x_dst.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PsrldqXRegImm>(x_dst.machine_reg(), int8_t{12});
   // 1. Clamp neg/NaN to 0 via MAXPS with the zeroed scratch.
-  builder_.Gen<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+  GenRaw<x86_64::MaxpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
   // 2. Broadcast 2^31 = 0x4F000000 to all four FP32 lanes.
   Register gp = std::get<0>(Gen<x86_64::MovlRegImm>(static_cast<int32_t>(0x4F000000)));
-  builder_.Gen<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(
-      x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
+  GenRaw<x86_64::MovdXRegReg>(x_pow31.machine_reg(), gp);
+  GenRaw<x86_64::PshufdXRegXRegImm>(x_pow31.machine_reg(), x_pow31.machine_reg(), int8_t{0x00});
   // 3. needs_offset = (2^31 <= src_clamped).
-  builder_.Gen<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
-  builder_.Gen<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(x_needs_off.machine_reg(), x_pow31.machine_reg());
+  GenRaw<x86_64::CmplepsXRegXReg>(x_needs_off.machine_reg(), x_dst.machine_reg());
   // 4. offset_amount = 2^31 where needs_offset.
-  builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-  builder_.Gen<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(x_scratch.machine_reg(), x_needs_off.machine_reg());
   // 5. src_for_cvt = src_clamped - offset_amount.
-  builder_.Gen<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+  GenRaw<x86_64::SubpsXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
   // 6. too_big = (2^31 <= src_for_cvt).
-  builder_.Gen<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
-  builder_.Gen<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(x_scratch.machine_reg(), x_pow31.machine_reg());
+  GenRaw<x86_64::CmplepsXRegXReg>(x_scratch.machine_reg(), x_dst.machine_reg());
   // 7. CVTTPS2DQ.
-  builder_.Gen<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
+  GenRaw<x86_64::Cvttps2dqXRegXReg>(x_dst.machine_reg(), x_dst.machine_reg());
   // 8. Build 0x80000000 per lane; AND needs_offset; OR into result.
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
-  builder_.Gen<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(x_pow31.machine_reg(), x_pow31.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(x_pow31.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PandXRegXReg>(x_pow31.machine_reg(), x_needs_off.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_pow31.machine_reg());
   // 9. Saturate too-big lanes to 0xFFFFFFFF.
-  builder_.Gen<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(x_dst.machine_reg(), x_scratch.machine_reg());
   SetVRegFull(args.rd, x_dst, /*q=*/false);
 }
 
@@ -12572,22 +12616,22 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     FpRegister res = xn;
     switch (args.opcode) {
       case ScOp::kAdd:
-        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case ScOp::kSub:
-        builder_.Gen<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsubqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case ScOp::kCmeq:
-        builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case ScOp::kCmgt:
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       case ScOp::kCmge: {
         // CMGE Vn,Vm == !(Vm > Vn): PCMPGTQ(xm,xn) then XOR all-ones.
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xn.machine_reg());
         FpRegister ones = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
         res = xm;
         break;
       }
@@ -12595,34 +12639,34 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
         // Unsigned >: XOR the sign bit (1<<63) of both operands, then signed
         // PCMPGTQ(xn,xm) implements the unsigned compare.
         FpRegister sign = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       }
       case ScOp::kCmhs: {
         // Unsigned >=: sign-bias, then !(xm > xn).
         FpRegister sign = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(sign.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), int8_t{63});
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(xm.machine_reg(), xn.machine_reg());
         FpRegister ones = AllocOnesSimdReg();
-        builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), ones.machine_reg());
         res = xm;
         break;
       }
       case ScOp::kCmtst: {
         // (Vn & Vm) != 0 ? all-ones : 0. PAND, compare AND-vs-0, invert.
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), xm.machine_reg());
         FpRegister z = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), z.machine_reg());
+        GenRaw<x86_64::PcmpeqqXRegXReg>(xn.machine_reg(), z.machine_reg());
         // z already has a def, so self-PCMPEQD (build all-ones) is legal.
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(z.machine_reg(), z.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), z.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(z.machine_reg(), z.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), z.machine_reg());
         break;
       }
       default:
@@ -12661,23 +12705,31 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     builder_.GenGetSimd<16>(xm.machine_reg(), GetVRegOffset(args.rm));
     // Scrub both operands to lane 0 (keep low (1<<size) bytes).
     const int8_t scrub = static_cast<int8_t>(16 - (1 << args.size));  // 15,14,12,8
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
-    builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), scrub);
-    builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), scrub);
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), scrub);
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), scrub);
+    GenRaw<x86_64::PslldqXRegImm>(xm.machine_reg(), scrub);
+    GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), scrub);
     if (args.size == 0b00) {  // B
-      if (is_add && !is_unsigned)       builder_.Gen<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else if (is_add && is_unsigned)   builder_.Gen<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else if (!is_add && !is_unsigned) builder_.Gen<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else                              builder_.Gen<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (is_add && !is_unsigned)
+        GenRaw<x86_64::PaddsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else if (is_add && is_unsigned)
+        GenRaw<x86_64::PaddusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else if (!is_add && !is_unsigned)
+        GenRaw<x86_64::PsubsbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else
+        GenRaw<x86_64::PsubusbXRegXReg>(xn.machine_reg(), xm.machine_reg());
       SetVRegFull(args.rd, xn, /*q=*/false);
       return;
     }
     if (args.size == 0b01) {  // H
-      if (is_add && !is_unsigned)       builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else if (is_add && is_unsigned)   builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else if (!is_add && !is_unsigned) builder_.Gen<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      else                              builder_.Gen<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (is_add && !is_unsigned)
+        GenRaw<x86_64::PaddswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else if (is_add && is_unsigned)
+        GenRaw<x86_64::PadduswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else if (!is_add && !is_unsigned)
+        GenRaw<x86_64::PsubswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      else
+        GenRaw<x86_64::PsubuswXRegXReg>(xn.machine_reg(), xm.machine_reg());
       SetVRegFull(args.rd, xn, /*q=*/false);
       return;
     }
@@ -12687,60 +12739,60 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
         FpRegister t_sum = AllocTempSimdReg();
         FpRegister t_ovf = AllocTempSimdReg();
         FpRegister t_sat = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // ~(a^b)
-        builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});        // ovf mask
-        builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});           // sign(a)
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});            // 0x7FFFFFFF
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());     // sat
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // ~(a^b)
+        GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});     // ovf mask
+        GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});        // sign(a)
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});         // 0x7FFFFFFF
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sat
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
       } else if (is_add && is_unsigned) {
         // UQADD 32: wrap-add + PMAXUD overflow detect.
         FpRegister t_a = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_a.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());     // sum
-        builder_.Gen<x86_64::PmaxudXRegXReg>(t_a.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_a.machine_reg(), xn.machine_reg());  // -1 no ovf
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());   // -1
-        builder_.Gen<x86_64::PxorXRegXReg>(t_a.machine_reg(), xm.machine_reg());     // -1 where ovf
-        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), t_a.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_a.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sum
+        GenRaw<x86_64::PmaxudXRegXReg>(t_a.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(t_a.machine_reg(), xn.machine_reg());  // -1 no ovf
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());   // -1
+        GenRaw<x86_64::PxorXRegXReg>(t_a.machine_reg(), xm.machine_reg());     // -1 where ovf
+        GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), t_a.machine_reg());
       } else if (!is_add && !is_unsigned) {
         // SQSUB 32: wrap-sub + sign-bit XOR-blend.
         FpRegister t_diff = AllocTempSimdReg();
         FpRegister t_ovf = AllocTempSimdReg();
         FpRegister t_sat = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // a^b
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg()); // a^diff
-        builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-        builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
-        builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});            // sign(a)
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFFFFFF
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // a^b
+        GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
+        GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+        GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});  // sign(a)
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{1});         // 0x7FFFFFFF
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sat
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
       } else {
         // UQSUB 32: (a>=b) ? a-b : 0, via PMINUD.
         FpRegister t_mask = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 where a>=b
-        builder_.Gen<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(t_mask.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PminudXRegXReg>(t_mask.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // -1 where a>=b
+        GenRaw<x86_64::PsubdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_mask.machine_reg());
       }
       SetVRegFull(args.rd, xn, /*q=*/false);
       return;
@@ -12753,71 +12805,76 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
       FpRegister t_sum = AllocTempSimdReg();
       FpRegister t_ovf = AllocTempSimdReg();
       FpRegister t_sat = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
-      builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // ~(a^b)
-      builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(t_ovf.machine_reg(), t_ovf.machine_reg(), static_cast<int8_t>(0xF5));
-      builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xF5));
-      builder_.Gen<x86_64::PsrlqXRegImm>(xm.machine_reg(), int8_t{1});            // 0x7FFF..FF
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());     // sat
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(t_sum.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());  // -1
+      GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // ~(a^b)
+      GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PshufdXRegXRegImm>(
+          t_ovf.machine_reg(), t_ovf.machine_reg(), static_cast<int8_t>(0xF5));
+      GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PshufdXRegXRegImm>(
+          xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xF5));
+      GenRaw<x86_64::PsrlqXRegImm>(xm.machine_reg(), int8_t{1});         // 0x7FFF..FF
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sat
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_sum.machine_reg());
     } else if (is_add && is_unsigned) {
       // UQADD 64: wrap-add + PCMPGTQ(sign-flipped) overflow detect (SSE4.2).
       FpRegister t_a = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_a.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());    // sum
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PsllqXRegImm>(xm.machine_reg(), int8_t{63});           // sign mask
-      builder_.Gen<x86_64::PxorXRegXReg>(t_a.machine_reg(), xm.machine_reg());    // a ^ sign
-      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), xn.machine_reg());     // sum ^ sign
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(t_a.machine_reg(), xm.machine_reg()); // -1 where a>sum (ovf)
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), t_a.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_a.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sum
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PsllqXRegImm>(xm.machine_reg(), int8_t{63});            // sign mask
+      GenRaw<x86_64::PxorXRegXReg>(t_a.machine_reg(), xm.machine_reg());     // a ^ sign
+      GenRaw<x86_64::PxorXRegXReg>(xm.machine_reg(), xn.machine_reg());      // sum ^ sign
+      GenRaw<x86_64::PcmpgtqXRegXReg>(t_a.machine_reg(), xm.machine_reg());  // -1 where a>sum (ovf)
+      GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), t_a.machine_reg());
     } else if (!is_add && !is_unsigned) {
       // SQSUB 64: wrap-sub + sign-bit XOR-blend.
       FpRegister t_diff = AllocTempSimdReg();
       FpRegister t_ovf = AllocTempSimdReg();
       FpRegister t_sat = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsubqXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());   // a^b
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg()); // a^diff
-      builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-      builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(t_ovf.machine_reg(), t_ovf.machine_reg(), static_cast<int8_t>(0xF5));
-      builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xF5));
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(xm.machine_reg(), int8_t{1});             // 0x7FFF..FF
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());      // sat
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xm.machine_reg());  // a^b
+      GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_diff.machine_reg());  // a^diff
+      GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+      GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PshufdXRegXRegImm>(
+          t_ovf.machine_reg(), t_ovf.machine_reg(), static_cast<int8_t>(0xF5));
+      GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PshufdXRegXRegImm>(
+          xn.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xF5));
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PsrlqXRegImm>(xm.machine_reg(), int8_t{1});         // 0x7FFF..FF
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());  // sat
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), t_ovf.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
     } else {
       // UQSUB 64: (a>=b) ? a-b : 0, via sign-flipped PCMPGTQ (SSE4.2).
       FpRegister t_diff = AllocTempSimdReg();
       FpRegister t_mask = AllocOnesSimdReg();  // -1 (AllocOnes avoids fresh self-PCMPEQ trap)
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsubqXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PsllqXRegImm>(t_mask.machine_reg(), int8_t{63});        // sign mask
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), t_mask.machine_reg());  // a ^ sign
-      builder_.Gen<x86_64::PxorXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // b ^ sign
-      builder_.Gen<x86_64::PcmpgtqXRegXReg>(t_mask.machine_reg(), xn.machine_reg()); // -1 where b>a (underflow)
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(t_mask.machine_reg(), xn.machine_reg());  // -1 where a>=b
-      builder_.Gen<x86_64::PandXRegXReg>(t_diff.machine_reg(), t_mask.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(t_diff.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(t_diff.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PsllqXRegImm>(t_mask.machine_reg(), int8_t{63});        // sign mask
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), t_mask.machine_reg());  // a ^ sign
+      GenRaw<x86_64::PxorXRegXReg>(t_mask.machine_reg(), xm.machine_reg());  // b ^ sign
+      GenRaw<x86_64::PcmpgtqXRegXReg>(t_mask.machine_reg(),
+                                      xn.machine_reg());  // -1 where b>a (underflow)
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(t_mask.machine_reg(), xn.machine_reg());  // -1 where a>=b
+      GenRaw<x86_64::PandXRegXReg>(t_diff.machine_reg(), t_mask.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xn.machine_reg(), t_diff.machine_reg());
     }
     SetVRegFull(args.rd, xn, /*q=*/false);
     return;
@@ -12937,12 +12994,16 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
 
     if (args.opcode == ScOp::kFabd) {
       // |a - b|: SUBSS/SUBSD then AND with the non-sign mask.
-      if (is_double) builder_.Gen<x86_64::SubsdXRegXReg>(n.machine_reg(), m.machine_reg());
-      else           builder_.Gen<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::SubsdXRegXReg>(n.machine_reg(), m.machine_reg());
+      else
+        GenRaw<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
       FpRegister mask = AllocOnesSimdReg();  // all-ones
-      if (is_double) builder_.Gen<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
-      else           builder_.Gen<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
-      builder_.Gen<x86_64::PandXRegXReg>(n.machine_reg(), mask.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::PsrlqXRegImm>(mask.machine_reg(), int8_t{1});
+      else
+        GenRaw<x86_64::PsrldXRegImm>(mask.machine_reg(), int8_t{1});
+      GenRaw<x86_64::PandXRegXReg>(n.machine_reg(), mask.machine_reg());
       SetVRegScalar(args.rd, n, is_double);
       return;
     }
@@ -12953,31 +13014,41 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
       FpRegister mul_unord = AllocTempSimdReg();
       FpRegister input_unord = AllocTempSimdReg();
       FpRegister two = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), n.machine_reg());
-      if (is_double) builder_.Gen<x86_64::MulsdXRegXReg>(mul.machine_reg(), m.machine_reg());
-      else           builder_.Gen<x86_64::MulssXRegXReg>(mul.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
-      if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
-      else           builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(input_unord.machine_reg(), n.machine_reg());
-      if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(input_unord.machine_reg(), m.machine_reg());
-      else           builder_.Gen<x86_64::CmpunordpsXRegXReg>(input_unord.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mul.machine_reg(), n.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::MulsdXRegXReg>(mul.machine_reg(), m.machine_reg());
+      else
+        GenRaw<x86_64::MulssXRegXReg>(mul.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+      else
+        GenRaw<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(input_unord.machine_reg(), n.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::CmpunordpdXRegXReg>(input_unord.machine_reg(), m.machine_reg());
+      else
+        GenRaw<x86_64::CmpunordpsXRegXReg>(input_unord.machine_reg(), m.machine_reg());
       // special = (NOT input_unord) AND mul_unord  (PANDN dst = ~dst & src).
-      builder_.Gen<x86_64::PandnXRegXReg>(input_unord.machine_reg(), mul_unord.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(input_unord.machine_reg(), mul_unord.machine_reg());
       // two_signed = (a ^ b) & signmask | bits(+-2.0).  (n is free after mul.)
-      builder_.Gen<x86_64::PxorXRegXReg>(n.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());  // -1
-      if (is_double) builder_.Gen<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
-      else           builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
-      builder_.Gen<x86_64::PandXRegXReg>(n.machine_reg(), mul_unord.machine_reg());
-      if (is_double) builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), GetImm(uint64_t{0x4000000000000000ULL}));
-      else           builder_.Gen<x86_64::MovdXRegReg>(two.machine_reg(), GetImm(uint64_t{0x40000000ULL}));
-      builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), two.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(n.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());  // -1
+      if (is_double)
+        GenRaw<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
+      else
+        GenRaw<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+      GenRaw<x86_64::PandXRegXReg>(n.machine_reg(), mul_unord.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::MovqXRegReg>(two.machine_reg(), GetImm(uint64_t{0x4000000000000000ULL}));
+      else
+        GenRaw<x86_64::MovdXRegReg>(two.machine_reg(), GetImm(uint64_t{0x40000000ULL}));
+      GenRaw<x86_64::PorXRegXReg>(n.machine_reg(), two.machine_reg());
       // result = (mul & ~special) | (two & special).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(m.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(m.machine_reg(), input_unord.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(input_unord.machine_reg(), mul.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(input_unord.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(m.machine_reg(), n.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(m.machine_reg(), input_unord.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(input_unord.machine_reg(), mul.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(input_unord.machine_reg(), m.machine_reg());
       SetVRegScalar(args.rd, input_unord, is_double);
       return;
     }
@@ -12996,48 +13067,58 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     FpRegister iu = AllocTempSimdReg();
     FpRegister special = AllocTempSimdReg();
     // input_unord = cmpunord(a,b).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(iu.machine_reg(), n.machine_reg());
-    if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(iu.machine_reg(), m.machine_reg());
-    else           builder_.Gen<x86_64::CmpunordpsXRegXReg>(iu.machine_reg(), m.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(iu.machine_reg(), n.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::CmpunordpdXRegXReg>(iu.machine_reg(), m.machine_reg());
+    else
+      GenRaw<x86_64::CmpunordpsXRegXReg>(iu.machine_reg(), m.machine_reg());
     // mul_unord = cmpunord(a*b, a*b).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), n.machine_reg());
-    if (is_double) builder_.Gen<x86_64::MulsdXRegXReg>(mul.machine_reg(), m.machine_reg());
-    else           builder_.Gen<x86_64::MulssXRegXReg>(mul.machine_reg(), m.machine_reg());
-    if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(mul.machine_reg(), mul.machine_reg());
-    else           builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul.machine_reg(), mul.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mul.machine_reg(), n.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::MulsdXRegXReg>(mul.machine_reg(), m.machine_reg());
+    else
+      GenRaw<x86_64::MulssXRegXReg>(mul.machine_reg(), m.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::CmpunordpdXRegXReg>(mul.machine_reg(), mul.machine_reg());
+    else
+      GenRaw<x86_64::CmpunordpsXRegXReg>(mul.machine_reg(), mul.machine_reg());
     // special = (NOT iu) AND mul_unord (preserve iu).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), iu.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(special.machine_reg(), iu.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
     // fma = K_fma - a*b (into mul, reused).
     if (is_double) {
-      builder_.Gen<x86_64::MovqXRegReg>(mul.machine_reg(), GetImm(k_fma_d));
-      builder_.Gen<x86_64::Vfnmadd231sdXRegXRegXReg>(mul.machine_reg(), n.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(mul.machine_reg(), GetImm(k_fma_d));
+      GenRaw<x86_64::Vfnmadd231sdXRegXRegXReg>(mul.machine_reg(), n.machine_reg(), m.machine_reg());
     } else {
-      builder_.Gen<x86_64::MovdXRegReg>(mul.machine_reg(), GetImm(k_fma_s));
-      builder_.Gen<x86_64::Vfnmadd231ssXRegXRegXReg>(mul.machine_reg(), n.machine_reg(), m.machine_reg());
+      GenRaw<x86_64::MovdXRegReg>(mul.machine_reg(), GetImm(k_fma_s));
+      GenRaw<x86_64::Vfnmadd231ssXRegXRegXReg>(mul.machine_reg(), n.machine_reg(), m.machine_reg());
     }
     if (!is_frecps) {
       // FRSQRTS: divide by 2 (exact). Reuse n as the +2.0 divisor.
       if (is_double) {
-        builder_.Gen<x86_64::MovqXRegReg>(n.machine_reg(), GetImm(two_d));
-        builder_.Gen<x86_64::DivsdXRegXReg>(mul.machine_reg(), n.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(n.machine_reg(), GetImm(two_d));
+        GenRaw<x86_64::DivsdXRegXReg>(mul.machine_reg(), n.machine_reg());
       } else {
-        builder_.Gen<x86_64::MovdXRegReg>(n.machine_reg(), GetImm(two_s));
-        builder_.Gen<x86_64::DivssXRegXReg>(mul.machine_reg(), n.machine_reg());
+        GenRaw<x86_64::MovdXRegReg>(n.machine_reg(), GetImm(two_s));
+        GenRaw<x86_64::DivssXRegXReg>(mul.machine_reg(), n.machine_reg());
       }
     }
     // result_first = special ? K_sat : fma  (build K_sat in n).
-    if (is_double) builder_.Gen<x86_64::MovqXRegReg>(n.machine_reg(), GetImm(k_sat_d));
-    else           builder_.Gen<x86_64::MovdXRegReg>(n.machine_reg(), GetImm(k_sat_s));
-    builder_.Gen<x86_64::PandXRegXReg>(n.machine_reg(), special.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());  // ~special & fma
-    builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), special.machine_reg());       // result_first
+    if (is_double)
+      GenRaw<x86_64::MovqXRegReg>(n.machine_reg(), GetImm(k_sat_d));
+    else
+      GenRaw<x86_64::MovdXRegReg>(n.machine_reg(), GetImm(k_sat_s));
+    GenRaw<x86_64::PandXRegXReg>(n.machine_reg(), special.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());  // ~special & fma
+    GenRaw<x86_64::PorXRegXReg>(n.machine_reg(), special.machine_reg());      // result_first
     // result_final = iu ? qnan : result_first  (build qnan in m).
-    if (is_double) builder_.Gen<x86_64::MovqXRegReg>(m.machine_reg(), GetImm(qnan_d));
-    else           builder_.Gen<x86_64::MovdXRegReg>(m.machine_reg(), GetImm(qnan_s));
-    builder_.Gen<x86_64::PandXRegXReg>(m.machine_reg(), iu.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(iu.machine_reg(), n.machine_reg());          // ~iu & result_first
-    builder_.Gen<x86_64::PorXRegXReg>(m.machine_reg(), iu.machine_reg());            // result_final
+    if (is_double)
+      GenRaw<x86_64::MovqXRegReg>(m.machine_reg(), GetImm(qnan_d));
+    else
+      GenRaw<x86_64::MovdXRegReg>(m.machine_reg(), GetImm(qnan_s));
+    GenRaw<x86_64::PandXRegXReg>(m.machine_reg(), iu.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(iu.machine_reg(), n.machine_reg());  // ~iu & result_first
+    GenRaw<x86_64::PorXRegXReg>(m.machine_reg(), iu.machine_reg());    // result_final
     SetVRegScalar(args.rd, m, is_double);
     return;
   }
@@ -13065,22 +13146,24 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
       builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
       // Scrub to lane 0 (keep low 2 bytes).
       for (FpRegister r : {xn, xm, xd}) {
-        builder_.Gen<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{14});
-        builder_.Gen<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{14});
+        GenRaw<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{14});
+        GenRaw<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{14});
       }
       FpRegister x_min = AllocOnesSimdReg();
-      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // 0x8000 bcast
+      GenRaw<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // 0x8000 bcast
       FpRegister xn_c = AllocTempSimdReg();
       FpRegister xm_c = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_c.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_c.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());  // stage 1
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_c.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_c.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn_c.machine_reg(), xm_c.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_c.machine_reg());    // corner fix
-      if (is_sub) builder_.Gen<x86_64::PsubswXRegXReg>(xd.machine_reg(), xn.machine_reg());
-      else        builder_.Gen<x86_64::PaddswXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xn_c.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xm_c.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());  // stage 1
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xn_c.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xm_c.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn_c.machine_reg(), xm_c.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_c.machine_reg());  // corner fix
+      if (is_sub)
+        GenRaw<x86_64::PsubswXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      else
+        GenRaw<x86_64::PaddswXRegXReg>(xd.machine_reg(), xn.machine_reg());
       SetVRegFull(args.rd, xd, /*q=*/false);
       return;
     }
@@ -13096,55 +13179,57 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     builder_.GenGetSimd<16>(xm.machine_reg(), GetVRegOffset(args.rm));
     builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
     for (FpRegister r : {xn, xm, xd}) {
-      builder_.Gen<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{12});  // keep low 4 bytes
-      builder_.Gen<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{12});
+      GenRaw<x86_64::PslldqXRegImm>(r.machine_reg(), int8_t{12});  // keep low 4 bytes
+      GenRaw<x86_64::PsrldqXRegImm>(r.machine_reg(), int8_t{12});
     }
     FpRegister x_const = AllocOnesSimdReg();
-    builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});  // INT32_MIN bcast
+    GenRaw<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});  // INT32_MIN bcast
     FpRegister corner = AllocTempSimdReg();
     FpRegister xp = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xp.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xp.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(corner.machine_reg(), xp.machine_reg());
     // Stage 1: 2 * sext(Vn.s0) * sext(Vm.s0), rounded (+2^31), high32 -> dword0.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xp.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PmuldqXRegXReg>(xp.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PsllqXRegImm>(xp.machine_reg(), int8_t{1});  // double
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
-    builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});  // 2^31 per qword
-    builder_.Gen<x86_64::PaddqXRegXReg>(xp.machine_reg(), x_const.machine_reg());  // rounding
-    builder_.Gen<x86_64::PsrlqXRegImm>(xp.machine_reg(), int8_t{32});  // high32 -> dword0
-    builder_.Gen<x86_64::PxorXRegXReg>(xp.machine_reg(), corner.machine_reg());  // corner -> INT32_MAX
+    GenRaw<x86_64::MovdqaXRegXReg>(xp.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PmuldqXRegXReg>(xp.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PsllqXRegImm>(xp.machine_reg(), int8_t{1});  // double
+    GenRaw<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+    GenRaw<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});         // 2^31 per qword
+    GenRaw<x86_64::PaddqXRegXReg>(xp.machine_reg(), x_const.machine_reg());  // rounding
+    GenRaw<x86_64::PsrlqXRegImm>(xp.machine_reg(), int8_t{32});              // high32 -> dword0
+    GenRaw<x86_64::PxorXRegXReg>(xp.machine_reg(), corner.machine_reg());    // corner -> INT32_MAX
     // Stage 2: 32-bit signed-saturating accumulate xd (+/-)= xp (wrap + XOR-blend).
     FpRegister t_sum = AllocTempSimdReg();
     FpRegister t_ovf = AllocTempSimdReg();
     FpRegister t_sat = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xd.machine_reg());
-    if (is_sub) builder_.Gen<x86_64::PsubdXRegXReg>(t_sum.machine_reg(), xp.machine_reg());
-    else        builder_.Gen<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xp.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xd.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xp.machine_reg());       // d ^ p
-    builder_.Gen<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xd.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());    // d ^ sum
+    GenRaw<x86_64::MovdqaXRegXReg>(t_sum.machine_reg(), xd.machine_reg());
+    if (is_sub)
+      GenRaw<x86_64::PsubdXRegXReg>(t_sum.machine_reg(), xp.machine_reg());
+    else
+      GenRaw<x86_64::PadddXRegXReg>(t_sum.machine_reg(), xp.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(t_ovf.machine_reg(), xd.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xp.machine_reg());  // d ^ p
+    GenRaw<x86_64::MovdqaXRegXReg>(t_sat.machine_reg(), xd.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(t_sat.machine_reg(), t_sum.machine_reg());  // d ^ sum
     if (!is_sub) {
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), xp.machine_reg());     // -1
-      builder_.Gen<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xp.machine_reg());     // ~(d^p)
-      builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(xp.machine_reg(), int8_t{1});               // 0x7FFFFFFF
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), xp.machine_reg());  // -1
+      GenRaw<x86_64::PxorXRegXReg>(t_ovf.machine_reg(), xp.machine_reg());  // ~(d^p)
+      GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xp.machine_reg(), int8_t{1});  // 0x7FFFFFFF
     } else {
-      builder_.Gen<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), xp.machine_reg());
-      builder_.Gen<x86_64::PsrldXRegImm>(xp.machine_reg(), int8_t{1});               // 0x7FFFFFFF
+      GenRaw<x86_64::PandXRegXReg>(t_ovf.machine_reg(), t_sat.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xp.machine_reg(), xp.machine_reg());
+      GenRaw<x86_64::PsrldXRegImm>(xp.machine_reg(), int8_t{1});  // 0x7FFFFFFF
     }
-    builder_.Gen<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});             // ovf mask
-    builder_.Gen<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});                // sign(d)
-    builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xp.machine_reg());          // sat
-    builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), t_sum.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xd.machine_reg(), t_ovf.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), t_sum.machine_reg());
+    GenRaw<x86_64::PsradXRegImm>(t_ovf.machine_reg(), int8_t{31});     // ovf mask
+    GenRaw<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});        // sign(d)
+    GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(), xp.machine_reg());  // sat
+    GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(), t_sum.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xd.machine_reg(), t_ovf.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(), t_sum.machine_reg());
     SetVRegFull(args.rd, xd, /*q=*/false);
     return;
   }
@@ -13170,10 +13255,10 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     // Scrub to lane 0: keep the low 16 bits, zero bytes [15:2].
-    builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
-    builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{14});
-    builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{14});
+    GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{14});
+    GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{14});
+    GenRaw<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{14});
+    GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{14});
     if (is_round) {
       if (!host_platform::kHasSSSE3) {
         UndefinedReturningVoid();
@@ -13182,15 +13267,15 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
       FpRegister xn_corner = AllocTempSimdReg();
       FpRegister xm_corner = AllocTempSimdReg();
       FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
-      builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+      GenRaw<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
       SetVRegFull(args.rd, xn, /*q=*/false);
       return;
     }
@@ -13199,20 +13284,20 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
     FpRegister xn_corner = AllocTempSimdReg();
     FpRegister xm_corner = AllocTempSimdReg();
     FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
-    builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
-    builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
-    builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
-    builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
-    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
+    GenRaw<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
+    GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
+    GenRaw<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
+    GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
+    GenRaw<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+    GenRaw<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
     SetVRegFull(args.rd, xn, /*q=*/false);
     return;
   }
@@ -13232,45 +13317,47 @@ void HeavyOptimizerFrontend::AdvSimdScalarThreeSame(const Decoder::AdvSimdScalar
   builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
   builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
   // Scrub to lane 0: keep the low 32 bits, zero bytes [15:4].
-  builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
-  builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
-  builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{12});
-  builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PslldqXRegImm>(xm.machine_reg(), int8_t{12});
+  GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{12});
   // x_const = INT32_MIN broadcast across 4 dwords.
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
   // Corner: lane 0 where Vn.s[0] == INT32_MIN AND Vm.s[0] == INT32_MIN.
-  builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-  builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
   // Two PMULDQs reconstruct the signed 32x32 -> 64 products (even lanes in
   // xp_lo, odd lanes in xp_hi).
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
-  builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
-  builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-  builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
-  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
+  GenRaw<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
+  GenRaw<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
+  GenRaw<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
   // Double each 64-bit signed product.
-  builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
-  builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
+  GenRaw<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
+  GenRaw<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
   if (is_round) {
     // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
-    builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
-    builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-    builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+    GenRaw<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
+    GenRaw<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+    GenRaw<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
   }
   // Extract the upper 32 bits of each 64-bit lane and interleave.
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
-  builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
+  GenRaw<x86_64::PshufdXRegXRegImm>(
+      xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
+  GenRaw<x86_64::PshufdXRegXRegImm>(
+      xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
+  GenRaw<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
   // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
-  builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
+  GenRaw<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
   SetVRegFull(args.rd, xp_lo, /*q=*/false);
 }
 
@@ -13278,97 +13365,99 @@ HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitFmulxF32Packed(
     FpRegister a, FpRegister b) {
   // mul = a * b.
   FpRegister mul = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), a.machine_reg());
-  builder_.Gen<x86_64::MulpsXRegXReg>(mul.machine_reg(), b.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(mul.machine_reg(), a.machine_reg());
+  GenRaw<x86_64::MulpsXRegXReg>(mul.machine_reg(), b.machine_reg());
   // mul_unord = cmpunord(mul, mul) : -1/lane where mul is NaN.
   FpRegister mul_unord = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
-  builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+  GenRaw<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
   // special = (NOT input_unord) AND mul_unord : lanes that are exactly +-0*+-inf
   // (product NaN but neither input NaN). Pandn writes (NOT dst) AND src.
   FpRegister special = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), a.machine_reg());
-  builder_.Gen<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), b.machine_reg());
-  builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(special.machine_reg(), a.machine_reg());
+  GenRaw<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), b.machine_reg());
+  GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
   // two_signed = ((a XOR b) AND signmask) OR bits(+2.0). Reuse a as (a XOR b),
   // mul_unord as the per-lane sign mask (all-ones << 31).
-  builder_.Gen<x86_64::PxorXRegXReg>(a.machine_reg(), b.machine_reg());
-  builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
-  builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
-  builder_.Gen<x86_64::PandXRegXReg>(a.machine_reg(), mul_unord.machine_reg());
+  GenRaw<x86_64::PxorXRegXReg>(a.machine_reg(), b.machine_reg());
+  GenRaw<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+  GenRaw<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+  GenRaw<x86_64::PandXRegXReg>(a.machine_reg(), mul_unord.machine_reg());
   // +2.0 broadcast to all 4 dwords (0x40000000 per dword).
   FpRegister two = AllocTempSimdReg();
   Register gr = GetImm(uint64_t{0x4000000040000000ULL});
-  builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), gr);
-  builder_.Gen<x86_64::PunpcklqdqXRegXReg>(two.machine_reg(), two.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), two.machine_reg());  // a = +-2.0 per lane
+  GenRaw<x86_64::MovqXRegReg>(two.machine_reg(), gr);
+  GenRaw<x86_64::PunpcklqdqXRegXReg>(two.machine_reg(), two.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(a.machine_reg(), two.machine_reg());  // a = +-2.0 per lane
   // result = (mul AND NOT special) OR (+-2.0 AND special).
-  builder_.Gen<x86_64::PandXRegXReg>(a.machine_reg(), special.machine_reg());
-  builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(special.machine_reg(), a.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(a.machine_reg(), special.machine_reg());
+  GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(special.machine_reg(), a.machine_reg());
   return special;
 }
 
 HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitFpPairwiseMinMaxF32Packed(
     FpRegister xa, FpRegister xb, bool is_max, bool is_nm) {
   auto gen_min = [&](FpRegister d, FpRegister s) {
-    builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
+    GenRaw<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
   };
   auto gen_max = [&](FpRegister d, FpRegister s) {
-    builder_.Gen<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
+    GenRaw<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
   };
   auto gen_cmpeq0 = [&](FpRegister d, FpRegister z) {
-    builder_.Gen<x86_64::CmpeqpsXRegXReg>(d.machine_reg(), z.machine_reg());
+    GenRaw<x86_64::CmpeqpsXRegXReg>(d.machine_reg(), z.machine_reg());
   };
   auto gen_cmpunord = [&](FpRegister d, FpRegister s) {
-    builder_.Gen<x86_64::CmpunordpsXRegXReg>(d.machine_reg(), s.machine_reg());
+    GenRaw<x86_64::CmpunordpsXRegXReg>(d.machine_reg(), s.machine_reg());
   };
   // Corrective value for the +-0 tie: AND(a,b) for max, OR(a,b) for min.
   FpRegister corr = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(corr.machine_reg(), xa.machine_reg());
-  if (is_max) builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), xb.machine_reg());
-  else        builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), xb.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(corr.machine_reg(), xa.machine_reg());
+  if (is_max)
+    GenRaw<x86_64::PandXRegXReg>(corr.machine_reg(), xb.machine_reg());
+  else
+    GenRaw<x86_64::PorXRegXReg>(corr.machine_reg(), xb.machine_reg());
   // "both zero" mask (IEEE -0 == +0, so this catches both sign forms).
   FpRegister zero = AllocZeroedSimdReg();
   FpRegister eqa = AllocTempSimdReg();
   FpRegister eqb = AllocTempSimdReg();
-  builder_.Gen<x86_64::MovdqaXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(eqa.machine_reg(), xa.machine_reg());
   gen_cmpeq0(eqa, zero);
-  builder_.Gen<x86_64::MovdqaXRegXReg>(eqb.machine_reg(), xb.machine_reg());
+  GenRaw<x86_64::MovdqaXRegXReg>(eqb.machine_reg(), xb.machine_reg());
   gen_cmpeq0(eqb, zero);
-  builder_.Gen<x86_64::PandXRegXReg>(eqa.machine_reg(), eqb.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(eqa.machine_reg(), eqb.machine_reg());
   if (!is_nm) {
     // NaN-propagating: tmp = b; (Max|Min)(tmp,a); (Max|Min)(a,b); POR(a,tmp).
     FpRegister tmp = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xb.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xb.machine_reg());
     if (is_max) { gen_max(tmp, xa); gen_max(xa, xb); }
     else        { gen_min(tmp, xa); gen_min(xa, xb); }
-    builder_.Gen<x86_64::PorXRegXReg>(xa.machine_reg(), tmp.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xa.machine_reg(), tmp.machine_reg());
   } else {
     // NaN-suppressing: substitute each NaN lane with the other operand, then Max|Min.
     FpRegister ma = AllocTempSimdReg();
     FpRegister mb = AllocTempSimdReg();
     FpRegister sa = AllocTempSimdReg();
     FpRegister sb = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(ma.machine_reg(), xa.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(ma.machine_reg(), xa.machine_reg());
     gen_cmpunord(ma, ma);
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mb.machine_reg(), xb.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mb.machine_reg(), xb.machine_reg());
     gen_cmpunord(mb, mb);
-    builder_.Gen<x86_64::MovdqaXRegXReg>(sa.machine_reg(), ma.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(sa.machine_reg(), xb.machine_reg());   // ma & b
-    builder_.Gen<x86_64::MovdqaXRegXReg>(sb.machine_reg(), mb.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(sb.machine_reg(), xa.machine_reg());   // mb & a
-    builder_.Gen<x86_64::PandnXRegXReg>(ma.machine_reg(), xa.machine_reg());  // ~ma & a
-    builder_.Gen<x86_64::PandnXRegXReg>(mb.machine_reg(), xb.machine_reg());  // ~mb & b
-    builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), sa.machine_reg());    // a'
-    builder_.Gen<x86_64::PorXRegXReg>(mb.machine_reg(), sb.machine_reg());    // b'
+    GenRaw<x86_64::MovdqaXRegXReg>(sa.machine_reg(), ma.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(sa.machine_reg(), xb.machine_reg());  // ma & b
+    GenRaw<x86_64::MovdqaXRegXReg>(sb.machine_reg(), mb.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(sb.machine_reg(), xa.machine_reg());   // mb & a
+    GenRaw<x86_64::PandnXRegXReg>(ma.machine_reg(), xa.machine_reg());  // ~ma & a
+    GenRaw<x86_64::PandnXRegXReg>(mb.machine_reg(), xb.machine_reg());  // ~mb & b
+    GenRaw<x86_64::PorXRegXReg>(ma.machine_reg(), sa.machine_reg());    // a'
+    GenRaw<x86_64::PorXRegXReg>(mb.machine_reg(), sb.machine_reg());    // b'
     if (is_max) gen_max(ma, mb); else gen_min(ma, mb);
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xa.machine_reg(), ma.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xa.machine_reg(), ma.machine_reg());
   }
   // +-0 blend: corr = (eqa & corr) | (~eqa & xa).
-  builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), eqa.machine_reg());
-  builder_.Gen<x86_64::PandnXRegXReg>(eqa.machine_reg(), xa.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+  GenRaw<x86_64::PandXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+  GenRaw<x86_64::PandnXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(corr.machine_reg(), eqa.machine_reg());
   return corr;
 }
 
@@ -13398,15 +13487,15 @@ void HeavyOptimizerFrontend::AdvSimdScalarPairwise(const Decoder::AdvSimdScalarP
     FpRegister lo = no_fp_register, hi = no_fp_register;
     EmitWidenHalfVec(GetVRegOffset(args.rn), /*q=*/false, &lo, &hi);  // lo = [h0,h1,h2,h3]
     FpRegister xa = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::MovssXRegXReg>(xa.machine_reg(), lo.machine_reg());  // [h0,+0,+0,+0]
+    GenRaw<x86_64::MovssXRegXReg>(xa.machine_reg(), lo.machine_reg());  // [h0,+0,+0,+0]
     FpRegister t = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(t.machine_reg(), lo.machine_reg());
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(t.machine_reg(), t.machine_reg(), int8_t{0x01});
+    GenRaw<x86_64::MovdqaXRegXReg>(t.machine_reg(), lo.machine_reg());
+    GenRaw<x86_64::PshufdXRegXRegImm>(t.machine_reg(), t.machine_reg(), int8_t{0x01});
     FpRegister xb = AllocZeroedSimdReg();
-    builder_.Gen<x86_64::MovssXRegXReg>(xb.machine_reg(), t.machine_reg());  // [h1,+0,+0,+0]
+    GenRaw<x86_64::MovssXRegXReg>(xb.machine_reg(), t.machine_reg());  // [h1,+0,+0,+0]
     FpRegister result;
     if (is_faddp) {
-      builder_.Gen<x86_64::AddpsXRegXReg>(xa.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::AddpsXRegXReg>(xa.machine_reg(), xb.machine_reg());
       result = xa;
     } else {
       result = EmitFpPairwiseMinMaxF32Packed(xa, xb, is_max, is_nm);
@@ -13434,18 +13523,17 @@ void HeavyOptimizerFrontend::AdvSimdScalarPairwise(const Decoder::AdvSimdScalarP
   // xb = Vn lane 1 brought into lane 0. D/ADDP: qword1 via PSHUFD 0xEE; S:
   // dword1 via PSHUFD 0x01. Only lane 0 of xa/xb is consumed; upper-lane
   // garbage is discarded by SetVRegScalar.
-  builder_.Gen<x86_64::PshufdXRegXRegImm>(
-      xb.machine_reg(), xa.machine_reg(),
-      is_double ? static_cast<int8_t>(0xEEu) : int8_t{0x01});
+  GenRaw<x86_64::PshufdXRegXRegImm>(
+      xb.machine_reg(), xa.machine_reg(), is_double ? static_cast<int8_t>(0xEEu) : int8_t{0x01});
 
   FpRegister result = xa;
   if (is_addp) {
-    builder_.Gen<x86_64::PaddqXRegXReg>(xa.machine_reg(), xb.machine_reg());
+    GenRaw<x86_64::PaddqXRegXReg>(xa.machine_reg(), xb.machine_reg());
   } else if (is_faddp) {
     if (is_double) {
-      builder_.Gen<x86_64::AddpdXRegXReg>(xa.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::AddpdXRegXReg>(xa.machine_reg(), xb.machine_reg());
     } else {
-      builder_.Gen<x86_64::AddpsXRegXReg>(xa.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::AddpsXRegXReg>(xa.machine_reg(), xb.machine_reg());
     }
   } else {
     // FMAXP/FMINP/FMAXNMP/FMINNMP scalar. Mirror of lite's ±0-correct,
@@ -13454,43 +13542,53 @@ void HeavyOptimizerFrontend::AdvSimdScalarPairwise(const Decoder::AdvSimdScalarP
     // for min) over lanes where both inputs are zero, computed BEFORE the
     // min/max clobbers xa.
     auto gen_min = [&](FpRegister d, FpRegister s) {
-      if (is_double) builder_.Gen<x86_64::MinpdXRegXReg>(d.machine_reg(), s.machine_reg());
-      else builder_.Gen<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::MinpdXRegXReg>(d.machine_reg(), s.machine_reg());
+      else
+        GenRaw<x86_64::MinpsXRegXReg>(d.machine_reg(), s.machine_reg());
     };
     auto gen_max = [&](FpRegister d, FpRegister s) {
-      if (is_double) builder_.Gen<x86_64::MaxpdXRegXReg>(d.machine_reg(), s.machine_reg());
-      else builder_.Gen<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::MaxpdXRegXReg>(d.machine_reg(), s.machine_reg());
+      else
+        GenRaw<x86_64::MaxpsXRegXReg>(d.machine_reg(), s.machine_reg());
     };
     auto gen_cmpeq0 = [&](FpRegister d, FpRegister zero) {
-      if (is_double) builder_.Gen<x86_64::CmpeqpdXRegXReg>(d.machine_reg(), zero.machine_reg());
-      else builder_.Gen<x86_64::CmpeqpsXRegXReg>(d.machine_reg(), zero.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::CmpeqpdXRegXReg>(d.machine_reg(), zero.machine_reg());
+      else
+        GenRaw<x86_64::CmpeqpsXRegXReg>(d.machine_reg(), zero.machine_reg());
     };
     auto gen_cmpunord = [&](FpRegister d, FpRegister s) {
-      if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(d.machine_reg(), s.machine_reg());
-      else builder_.Gen<x86_64::CmpunordpsXRegXReg>(d.machine_reg(), s.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::CmpunordpdXRegXReg>(d.machine_reg(), s.machine_reg());
+      else
+        GenRaw<x86_64::CmpunordpsXRegXReg>(d.machine_reg(), s.machine_reg());
     };
     // Corrective value for the ±0 tie: AND(a,b) for max, OR(a,b) for min.
     FpRegister corr = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(corr.machine_reg(), xa.machine_reg());
-    if (is_fmax_family) builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), xb.machine_reg());
-    else builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), xb.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(corr.machine_reg(), xa.machine_reg());
+    if (is_fmax_family)
+      GenRaw<x86_64::PandXRegXReg>(corr.machine_reg(), xb.machine_reg());
+    else
+      GenRaw<x86_64::PorXRegXReg>(corr.machine_reg(), xb.machine_reg());
     // "both zero" mask (IEEE -0 == +0, so this catches both sign forms).
     FpRegister zero = AllocZeroedSimdReg();
     FpRegister eqa = AllocTempSimdReg();
     FpRegister eqb = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(eqa.machine_reg(), xa.machine_reg());
     gen_cmpeq0(eqa, zero);
-    builder_.Gen<x86_64::MovdqaXRegXReg>(eqb.machine_reg(), xb.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(eqb.machine_reg(), xb.machine_reg());
     gen_cmpeq0(eqb, zero);
-    builder_.Gen<x86_64::PandXRegXReg>(eqa.machine_reg(), eqb.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(eqa.machine_reg(), eqb.machine_reg());
     if (!is_nm) {
       // FMAXP/FMINP: NaN-propagating idiom. tmp = b; (Max|Min)(tmp,a);
       // (Max|Min)(a,b); POR(a,tmp) keeps NaN if either input was NaN.
       FpRegister tmp = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xb.machine_reg());
       if (is_fmax_family) { gen_max(tmp, xa); gen_max(xa, xb); }
       else { gen_min(tmp, xa); gen_min(xa, xb); }
-      builder_.Gen<x86_64::PorXRegXReg>(xa.machine_reg(), tmp.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xa.machine_reg(), tmp.machine_reg());
     } else {
       // FMAXNMP/FMINNMP: substitute each NaN lane with the other operand,
       // then Max|Min. Both-NaN yields NaN (min/max returns src2, still NaN).
@@ -13498,26 +13596,26 @@ void HeavyOptimizerFrontend::AdvSimdScalarPairwise(const Decoder::AdvSimdScalarP
       FpRegister mb = AllocTempSimdReg();
       FpRegister sa = AllocTempSimdReg();
       FpRegister sb = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(ma.machine_reg(), xa.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(ma.machine_reg(), xa.machine_reg());
       gen_cmpunord(ma, ma);  // 1s where a is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mb.machine_reg(), xb.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mb.machine_reg(), xb.machine_reg());
       gen_cmpunord(mb, mb);  // 1s where b is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(sa.machine_reg(), ma.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sa.machine_reg(), xb.machine_reg());   // ma & b
-      builder_.Gen<x86_64::MovdqaXRegXReg>(sb.machine_reg(), mb.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(sb.machine_reg(), xa.machine_reg());   // mb & a
-      builder_.Gen<x86_64::PandnXRegXReg>(ma.machine_reg(), xa.machine_reg());  // ~ma & a
-      builder_.Gen<x86_64::PandnXRegXReg>(mb.machine_reg(), xb.machine_reg());  // ~mb & b
-      builder_.Gen<x86_64::PorXRegXReg>(ma.machine_reg(), sa.machine_reg());    // a'
-      builder_.Gen<x86_64::PorXRegXReg>(mb.machine_reg(), sb.machine_reg());    // b'
+      GenRaw<x86_64::MovdqaXRegXReg>(sa.machine_reg(), ma.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sa.machine_reg(), xb.machine_reg());  // ma & b
+      GenRaw<x86_64::MovdqaXRegXReg>(sb.machine_reg(), mb.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(sb.machine_reg(), xa.machine_reg());   // mb & a
+      GenRaw<x86_64::PandnXRegXReg>(ma.machine_reg(), xa.machine_reg());  // ~ma & a
+      GenRaw<x86_64::PandnXRegXReg>(mb.machine_reg(), xb.machine_reg());  // ~mb & b
+      GenRaw<x86_64::PorXRegXReg>(ma.machine_reg(), sa.machine_reg());    // a'
+      GenRaw<x86_64::PorXRegXReg>(mb.machine_reg(), sb.machine_reg());    // b'
       if (is_fmax_family) gen_max(ma, mb);
       else gen_min(ma, mb);
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xa.machine_reg(), ma.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xa.machine_reg(), ma.machine_reg());
     }
     // ±0 blend: xa = (eqa & corr) | (~eqa & xa).
-    builder_.Gen<x86_64::PandXRegXReg>(corr.machine_reg(), eqa.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(eqa.machine_reg(), xa.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(corr.machine_reg(), eqa.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(eqa.machine_reg(), xa.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(corr.machine_reg(), eqa.machine_reg());
     result = corr;
   }
   SetVRegScalar(args.rd, result, is_double);
@@ -13583,38 +13681,38 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
       if (args.q) {
         // Bring Vn[127:64] into the low 64 so PMOVSX/PMOVZX widens it.
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
       }
       uint8_t shift_imm;
       if (immh & 0b0100) {  // 2S -> 2D
         shift_imm = static_cast<uint8_t>(immh_immb - 32);
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
         }
         if (shift_imm != 0) {
-          builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          GenRaw<x86_64::PsllqXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
         }
       } else if (immh & 0b0010) {  // 4H -> 4S
         shift_imm = static_cast<uint8_t>(immh_immb - 16);
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
         }
         if (shift_imm != 0) {
-          builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
         }
       } else {  // immh & 0b0001: 8B -> 8H
         shift_imm = static_cast<uint8_t>(immh_immb - 8);
         if (is_signed) {
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
         }
         if (shift_imm != 0) {
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(shift_imm));
         }
       }
       SetVRegFull(args.rd, xn, /*q=*/true);
@@ -13636,15 +13734,15 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
           const uint8_t n = static_cast<uint8_t>(immh_immb - 8);
           FpRegister xn = AllocTempSimdReg();
           builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(n));
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(n));
           const uint8_t mbyte = static_cast<uint8_t>((0xFFu << n) & 0xFFu);
           const uint64_t mword = 0x0101010101010101ULL * mbyte;
           FpRegister mask = AllocTempSimdReg();
           Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(mword)));
-          builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
+          GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
           // Broadcast the low 64-bit mask to the high 64 bits.
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(mask.machine_reg(), mask.machine_reg(), int8_t{0x44});
-          builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
+          GenRaw<x86_64::PshufdXRegXRegImm>(mask.machine_reg(), mask.machine_reg(), int8_t{0x44});
+          GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());
           SetVRegFull(args.rd, xn, args.q);
           return;
         }
@@ -13670,20 +13768,20 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xn = AllocTempSimdReg();
         FpRegister xn_hi = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+        GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
         if (is_signed_byte) {
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         }
         SetVRegFull(args.rd, xn, args.q);
         return;
@@ -13718,16 +13816,14 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xv = AllocTempSimdReg();
         FpRegister sign = AllocZeroedSimdReg();
         builder_.GenGetSimd<16>(xv.machine_reg(), vn_off);
-        builder_.Gen<x86_64::PcmpgtqXRegXReg>(sign.machine_reg(), xv.machine_reg());
+        GenRaw<x86_64::PcmpgtqXRegXReg>(sign.machine_reg(), xv.machine_reg());
         if (shift_count == 64) {
           SetVRegFull(args.rd, sign, args.q);
           return;
         }
-        builder_.Gen<x86_64::PsrlqXRegImm>(xv.machine_reg(),
-                                           static_cast<int8_t>(shift_count));
-        builder_.Gen<x86_64::PsllqXRegImm>(sign.machine_reg(),
-                                           static_cast<int8_t>(64 - shift_count));
-        builder_.Gen<x86_64::PorXRegXReg>(xv.machine_reg(), sign.machine_reg());
+        GenRaw<x86_64::PsrlqXRegImm>(xv.machine_reg(), static_cast<int8_t>(shift_count));
+        GenRaw<x86_64::PsllqXRegImm>(sign.machine_reg(), static_cast<int8_t>(64 - shift_count));
+        GenRaw<x86_64::PorXRegXReg>(xv.machine_reg(), sign.machine_reg());
         SetVRegFull(args.rd, xv, args.q);
         return;
       }
@@ -13736,25 +13832,25 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       const int8_t cnt = static_cast<int8_t>(shift_count);
       if (is_left) {
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
         }
       } else if (is_arith) {  // SSHR, esize 16 or 32
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
         }
       } else {  // USHR
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
         }
       }
       // Q=0 (incl. scalar) forms zero Vd[127:64] via SetVRegFull.
@@ -13789,24 +13885,24 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xn = AllocTempSimdReg();
         FpRegister xn_hi = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+        GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
         if (is_arith_byte) {
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), byte_cnt);
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         }
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
-        builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
         // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
         SetVRegFull(args.rd, xd, args.q);
         return;
@@ -13841,22 +13937,22 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
       if (is_arith) {  // SSRA, esize 16 or 32.
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
         } else {  // 32
-          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
         }
       } else {  // USRA, esize 16/32/64.
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
         } else {  // 64
-          builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
         }
       }
       // Q=0 (.4H/.2S, incl. scalar) zero Vd[127:64] via SetVRegFull's D-form
@@ -13907,44 +14003,44 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister round = AllocTempSimdReg();
         FpRegister round_hi = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
+        GenRaw<x86_64::MovdqaXRegXReg>(xn_hi.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsrldqXRegImm>(xn_hi.machine_reg(), int8_t{8});
         if (is_signed_byte) {
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovsxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
-          builder_.Gen<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PmovzxbwXRegXReg>(xn_hi.machine_reg(), xn_hi.machine_reg());
         }
-        builder_.Gen<x86_64::MovdqaXRegXReg>(round.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(round_hi.machine_reg(), xn_hi.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(round.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(round_hi.machine_reg(), xn_hi.machine_reg());
         // Isolate bit (cnt-1) of each byte into bit 0 of each 16-bit word.
-        builder_.Gen<x86_64::PsrlwXRegImm>(round.machine_reg(), cnt_minus_1);
-        builder_.Gen<x86_64::PsrlwXRegImm>(round_hi.machine_reg(), cnt_minus_1);
-        builder_.Gen<x86_64::PsllwXRegImm>(round.machine_reg(), int8_t{15});
-        builder_.Gen<x86_64::PsllwXRegImm>(round_hi.machine_reg(), int8_t{15});
-        builder_.Gen<x86_64::PsrlwXRegImm>(round.machine_reg(), int8_t{15});
-        builder_.Gen<x86_64::PsrlwXRegImm>(round_hi.machine_reg(), int8_t{15});
+        GenRaw<x86_64::PsrlwXRegImm>(round.machine_reg(), cnt_minus_1);
+        GenRaw<x86_64::PsrlwXRegImm>(round_hi.machine_reg(), cnt_minus_1);
+        GenRaw<x86_64::PsllwXRegImm>(round.machine_reg(), int8_t{15});
+        GenRaw<x86_64::PsllwXRegImm>(round_hi.machine_reg(), int8_t{15});
+        GenRaw<x86_64::PsrlwXRegImm>(round.machine_reg(), int8_t{15});
+        GenRaw<x86_64::PsrlwXRegImm>(round_hi.machine_reg(), int8_t{15});
         // Main shifted value: arith for signed, logical for unsigned.
         if (is_signed_byte) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn_hi.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn_hi.machine_reg(), cnt);
         }
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), round.machine_reg());
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), round_hi.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), round.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn_hi.machine_reg(), round_hi.machine_reg());
         if (is_signed_byte) {
-          builder_.Gen<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PacksswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn_hi.machine_reg());
         }
         FpRegister result = xn;
         if (is_accum_byte) {
           FpRegister xd = AllocTempSimdReg();
           builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
-          builder_.Gen<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PaddbXRegXReg>(xd.machine_reg(), xn.machine_reg());
           result = xd;
         }
         // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
@@ -13986,41 +14082,41 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       // Main shifted value in xn (arith for signed H/S, logical otherwise).
       if (esize_bits == 16) {
         if (is_signed) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
         }
       } else if (esize_bits == 32) {
         if (is_signed) {
-          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
         }
       } else {  // 64 (unsigned only; signed .2D bailed above)
-        builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+        GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
       }
       // Round bit in xr: isolate bit (shift-1) of Vn into bit 0 per lane via
       // PSRL(cnt-1) then a PSLL(esize-1)/PSRL(esize-1) bit-0 bracket.
       if (esize_bits == 16) {
-        builder_.Gen<x86_64::PsrlwXRegImm>(xr.machine_reg(), cnt_minus_1);
-        builder_.Gen<x86_64::PsllwXRegImm>(xr.machine_reg(), esize_minus_1);
-        builder_.Gen<x86_64::PsrlwXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrlwXRegImm>(xr.machine_reg(), cnt_minus_1);
+        GenRaw<x86_64::PsllwXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrlwXRegImm>(xr.machine_reg(), esize_minus_1);
       } else if (esize_bits == 32) {
-        builder_.Gen<x86_64::PsrldXRegImm>(xr.machine_reg(), cnt_minus_1);
-        builder_.Gen<x86_64::PslldXRegImm>(xr.machine_reg(), esize_minus_1);
-        builder_.Gen<x86_64::PsrldXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrldXRegImm>(xr.machine_reg(), cnt_minus_1);
+        GenRaw<x86_64::PslldXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrldXRegImm>(xr.machine_reg(), esize_minus_1);
       } else {  // 64
-        builder_.Gen<x86_64::PsrlqXRegImm>(xr.machine_reg(), cnt_minus_1);
-        builder_.Gen<x86_64::PsllqXRegImm>(xr.machine_reg(), esize_minus_1);
-        builder_.Gen<x86_64::PsrlqXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrlqXRegImm>(xr.machine_reg(), cnt_minus_1);
+        GenRaw<x86_64::PsllqXRegImm>(xr.machine_reg(), esize_minus_1);
+        GenRaw<x86_64::PsrlqXRegImm>(xr.machine_reg(), esize_minus_1);
       }
       // shifted + round bit.
       if (esize_bits == 16) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xr.machine_reg());
       } else if (esize_bits == 32) {
-        builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xr.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xr.machine_reg());
       }
       FpRegister result = xn;
       if (is_accumulate) {
@@ -14030,11 +14126,11 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         // Load orig Vd before the writeback; rd==rn safe (independent temps).
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PaddqXRegXReg>(xd.machine_reg(), xn.machine_reg());
         }
         result = xd;
       }
@@ -14078,18 +14174,18 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
         if (is_sli_byte) {
           if (sh != 0) {
-            builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(sh));
+            GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), static_cast<int8_t>(sh));
           }
         } else {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), static_cast<int8_t>(sh));
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), static_cast<int8_t>(sh));
         }
         Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(mword)));
-        builder_.Gen<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
+        GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), gm);
         // Broadcast the low 64-bit mask to the high 64 bits.
-        builder_.Gen<x86_64::PshufdXRegXRegImm>(mask.machine_reg(), mask.machine_reg(), int8_t{0x44});
-        builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());   // shifted bits
-        builder_.Gen<x86_64::PandnXRegXReg>(mask.machine_reg(), xd.machine_reg());  // ~mask & Vd
-        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), mask.machine_reg());
+        GenRaw<x86_64::PshufdXRegXRegImm>(mask.machine_reg(), mask.machine_reg(), int8_t{0x44});
+        GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mask.machine_reg());   // shifted bits
+        GenRaw<x86_64::PandnXRegXReg>(mask.machine_reg(), xd.machine_reg());  // ~mask & Vd
+        GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), mask.machine_reg());
         // Q=0 (.8B) zeroes Vd[127:64] via SetVRegFull's D-form merge.
         SetVRegFull(args.rd, xn, args.q);
         return;
@@ -14125,35 +14221,35 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       if (is_sli) {
         // Vd = (Vd keep low `shift` bits) | (Vn << shift).
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsllwXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrlwXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsllwXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrlwXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), cnt);
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PslldXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrldXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PslldXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrldXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), cnt);
         } else {  // 64
-          builder_.Gen<x86_64::PsllqXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrlqXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsllqXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrlqXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsllqXRegImm>(xn.machine_reg(), cnt);
         }
       } else {
         // SRI: Vd = (Vd keep high `shift` bits) | USHR(Vn, shift).
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsllwXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsllwXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PsrldXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PslldXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrldXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PslldXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
         } else {  // 64
-          builder_.Gen<x86_64::PsrlqXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsllqXRegImm>(xd.machine_reg(), inv);
-          builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlqXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsllqXRegImm>(xd.machine_reg(), inv);
+          GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
         }
       }
-      builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xd.machine_reg(), xn.machine_reg());
       // Q=0 (.4H/.2S, incl. scalar D) zero Vd[127:64] via SetVRegFull.
       SetVRegFull(args.rd, xd, args.q);
       return;
@@ -14217,80 +14313,80 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         // unsigned clamp below yields the architectural 0. xt is already zero
         // (AllocZeroedSimdReg), so PCMPGT(xt, xn) yields the neg-lane mask.
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PcmpgtqXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtqXRegXReg>(xt.machine_reg(), xn.machine_reg());
         }
-        builder_.Gen<x86_64::PandnXRegXReg>(xt.machine_reg(), xn.machine_reg());  // ~neg & xn
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn.machine_reg(), xt.machine_reg());
+        GenRaw<x86_64::PandnXRegXReg>(xt.machine_reg(), xn.machine_reg());  // ~neg & xn
+        GenRaw<x86_64::MovdqaXRegXReg>(xn.machine_reg(), xt.machine_reg());
       }
 
       // xs = xn << cnt.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xs.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xs.machine_reg(), xn.machine_reg());
       if (esize_bits == 16) {
-        builder_.Gen<x86_64::PsllwXRegImm>(xs.machine_reg(), cnt);
+        GenRaw<x86_64::PsllwXRegImm>(xs.machine_reg(), cnt);
       } else if (esize_bits == 32) {
-        builder_.Gen<x86_64::PslldXRegImm>(xs.machine_reg(), cnt);
+        GenRaw<x86_64::PslldXRegImm>(xs.machine_reg(), cnt);
       } else {
-        builder_.Gen<x86_64::PsllqXRegImm>(xs.machine_reg(), cnt);
+        GenRaw<x86_64::PsllqXRegImm>(xs.machine_reg(), cnt);
       }
       // xm = recover(xs): arithmetic (signed) / logical (unsigned) shift-right
       // by the same count. If it reproduces the source, the shift did not
       // overflow that lane.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm.machine_reg(), xs.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xm.machine_reg(), xs.machine_reg());
       if (is_signed) {  // SQSHL, esize 16/32 (esize 64 bailed above).
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xm.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xm.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsradXRegImm>(xm.machine_reg(), cnt);
+          GenRaw<x86_64::PsradXRegImm>(xm.machine_reg(), cnt);
         }
       } else {  // UQSHL / SQSHLU, esize 16/32/64.
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), cnt);
         } else if (esize_bits == 32) {
-          builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), cnt);
+          GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrlqXRegImm>(xm.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlqXRegImm>(xm.machine_reg(), cnt);
         }
       }
       // xm = eq_mask: per-lane all-ones where recover(shift) == source.
       if (esize_bits == 16) {
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqwXRegXReg>(xm.machine_reg(), xn.machine_reg());
       } else if (esize_bits == 32) {
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xm.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PcmpeqqXRegXReg>(xm.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqqXRegXReg>(xm.machine_reg(), xn.machine_reg());
       }
 
       // Saturation target in xt.
       if (is_signed) {
         // SQSHL: sat = INT_MAX XOR neg_mask(xn). (esize 16/32 only.)
-        builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xt.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xt.machine_reg(), xt.machine_reg());
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtwXRegXReg>(xt.machine_reg(), xn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PcmpgtdXRegXReg>(xt.machine_reg(), xn.machine_reg());
         }
         // xn is now free (its value was consumed by the eq_mask + neg_mask);
         // reuse it to hold INT_MAX = PSRL(all-ones, 1).
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xn.machine_reg(), xn.machine_reg());
         if (esize_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{1});
         } else {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{1});
         }
-        builder_.Gen<x86_64::PxorXRegXReg>(xt.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xt.machine_reg(), xn.machine_reg());
       } else {
         // UQSHL / SQSHLU: sat = UINT_MAX (all-ones) per lane.
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(xt.machine_reg(), xt.machine_reg());
+        GenRaw<x86_64::PcmpeqdXRegXReg>(xt.machine_reg(), xt.machine_reg());
       }
 
       // Blend: result = (eq_mask & shifted) | (~eq_mask & sat).
-      builder_.Gen<x86_64::PandXRegXReg>(xs.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xm.machine_reg(), xt.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xs.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xs.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xm.machine_reg(), xt.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xs.machine_reg(), xm.machine_reg());
       // Q=0 (.4H/.2S) zero Vd[127:64] via SetVRegFull's D-form merge.
       SetVRegFull(args.rd, xs, args.q);
       return;
@@ -14341,25 +14437,25 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xround = AllocTempSimdReg();
         Register gr = std::get<0>(
             Gen<x86_64::MovqRegImm>(static_cast<int64_t>(round_pattern)));
-        builder_.Gen<x86_64::MovqXRegReg>(xround.machine_reg(), gr);
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(xround.machine_reg(), gr, int8_t{1});
+        GenRaw<x86_64::MovqXRegReg>(xround.machine_reg(), gr);
+        GenRaw<x86_64::PinsrqXRegRegImm>(xround.machine_reg(), gr, int8_t{1});
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xround.machine_reg());
         } else if (src_bits == 32) {
-          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xround.machine_reg());
         } else {
-          builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xround.machine_reg());
+          GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xround.machine_reg());
         }
       }
       // Logical right shift by cnt (in [1, dst_bits] <= src_bits/2), so the
       // high bits the narrow discards never reach the kept low half — SHRN's
       // untyped shift is bit-identical to a logical shift here.
       if (src_bits == 16) {
-        builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+        GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
       } else if (src_bits == 32) {
-        builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+        GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
       } else {
-        builder_.Gen<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
+        GenRaw<x86_64::PsrlqXRegImm>(xn.machine_reg(), cnt);
       }
       // PSHUFB narrow: the low-8 selector entries gather each wide lane's low
       // half into the packed low 64; the high-8 entries (0x80) zero the upper
@@ -14375,11 +14471,11 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
       }
       FpRegister xmask = AllocTempSimdReg();
       Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(mask_lo));
-      builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
+      GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
       Register gmhi = std::get<0>(
           Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
-      builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
+      GenRaw<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
       if (!args.q) {
         // SHRN: narrowed lanes sit in the low 64; SetVRegFull zeroes
         // Vd[127:64] via its D-form merge.
@@ -14391,9 +14487,9 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         FpRegister xdlow = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
         builder_.GenSetSimd<16>(vd_off, xdlow.machine_reg());
       }
       return;
@@ -14472,8 +14568,8 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister x = AllocTempSimdReg();
         Register gr =
             std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
-        builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+        GenRaw<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+        GenRaw<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
         return x;
       };
 
@@ -14492,8 +14588,7 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
           FpRegister xround = broadcast(round_pattern);
           if (src_bits == 16) {
             // PADDUSW: unsigned-saturating word add (SSE2).
-            builder_.Gen<x86_64::PadduswXRegXReg>(xn.machine_reg(),
-                                                  xround.machine_reg());
+            GenRaw<x86_64::PadduswXRegXReg>(xn.machine_reg(), xround.machine_reg());
           } else {
             // No unsigned-saturating PADDUSD in baseline SSE; pre-clamp xn to
             // (0xFFFFFFFF - round_lane) so the plain PADDD cannot overflow
@@ -14504,33 +14599,29 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
             const uint64_t clamp_pattern =
                 (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
             FpRegister xclamp = broadcast(clamp_pattern);
-            builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(),
-                                                 xclamp.machine_reg());
-            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
-                                                xround.machine_reg());
+            GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xclamp.machine_reg());
+            GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xround.machine_reg());
           }
         } else if (is_signed_to_unsigned) {
           // SQRSHRUN carry-bit identity: isolate bit (cnt-1) of each lane into
           // bit 0 (shift it to the top, then logically back). No wide add ->
           // no premature saturation.
           xcarry = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(xcarry.machine_reg(),
-                                               xn.machine_reg());
+          GenRaw<x86_64::MovdqaXRegXReg>(xcarry.machine_reg(), xn.machine_reg());
           if (src_bits == 16) {
-            builder_.Gen<x86_64::PsllwXRegImm>(
-                xcarry.machine_reg(), static_cast<int8_t>(16 - narrow_rshift));
-            builder_.Gen<x86_64::PsrlwXRegImm>(xcarry.machine_reg(), int8_t{15});
+            GenRaw<x86_64::PsllwXRegImm>(xcarry.machine_reg(),
+                                         static_cast<int8_t>(16 - narrow_rshift));
+            GenRaw<x86_64::PsrlwXRegImm>(xcarry.machine_reg(), int8_t{15});
           } else {
-            builder_.Gen<x86_64::PslldXRegImm>(
-                xcarry.machine_reg(), static_cast<int8_t>(32 - narrow_rshift));
-            builder_.Gen<x86_64::PsrldXRegImm>(xcarry.machine_reg(), int8_t{31});
+            GenRaw<x86_64::PslldXRegImm>(xcarry.machine_reg(),
+                                         static_cast<int8_t>(32 - narrow_rshift));
+            GenRaw<x86_64::PsrldXRegImm>(xcarry.machine_reg(), int8_t{31});
           }
         } else {  // SQRSHRN (signed->signed).
           FpRegister xround = broadcast(round_pattern);
           if (src_bits == 16) {
             // PADDSW: signed-saturating word add (SSE2).
-            builder_.Gen<x86_64::PaddswXRegXReg>(xn.machine_reg(),
-                                                 xround.machine_reg());
+            GenRaw<x86_64::PaddswXRegXReg>(xn.machine_reg(), xround.machine_reg());
           } else {
             // No integer PADDSD in baseline SSE; pre-clamp xn to
             // (0x7FFFFFFF - round_lane) so the plain PADDD cannot overflow
@@ -14543,25 +14634,23 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
             const uint64_t clamp_pattern =
                 (uint64_t{clamp_lane} << 32) | uint64_t{clamp_lane};
             FpRegister xclamp = broadcast(clamp_pattern);
-            builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(),
-                                                 xclamp.machine_reg());
-            builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
-                                                xround.machine_reg());
+            GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xclamp.machine_reg());
+            GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xround.machine_reg());
           }
         }
       }
 
       if (uses_signed_shift) {
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrawXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsradXRegImm>(xn.machine_reg(), cnt);
         }
       } else {
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), cnt);
         } else {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), cnt);
         }
       }
 
@@ -14570,11 +14659,9 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         // are small (|x>>cnt| <= INT*_MAX>>1), so a plain PADD cannot overflow
         // before the unsigned clamp below.
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PaddwXRegXReg>(xn.machine_reg(),
-                                              xcarry.machine_reg());
+          GenRaw<x86_64::PaddwXRegXReg>(xn.machine_reg(), xcarry.machine_reg());
         } else {
-          builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(),
-                                              xcarry.machine_reg());
+          GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xcarry.machine_reg());
         }
       }
 
@@ -14593,11 +14680,11 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xsatmax = broadcast(sat_max_pattern);
         FpRegister xsatmin = broadcast(sat_min_pattern);
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
-          builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          GenRaw<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
         } else {
-          builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
-          builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
+          GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          GenRaw<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xsatmin.machine_reg());
         }
       } else if (is_signed_to_unsigned) {
         // SQSHRUN: clamp the post-shift signed value to the unsigned dst
@@ -14610,11 +14697,11 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xsatmax = broadcast(sat_max_pattern);
         FpRegister xzero = AllocZeroedSimdReg();
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xzero.machine_reg());
-          builder_.Gen<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          GenRaw<x86_64::PmaxswXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+          GenRaw<x86_64::PminswXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
         } else {
-          builder_.Gen<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xzero.machine_reg());
-          builder_.Gen<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
+          GenRaw<x86_64::PmaxsdXRegXReg>(xn.machine_reg(), xzero.machine_reg());
+          GenRaw<x86_64::PminsdXRegXReg>(xn.machine_reg(), xsatmax.machine_reg());
         }
       } else {  // UQSHRN: unsigned-min clamp to (1 << dst_bits) - 1.
         const uint64_t sat_pattern =
@@ -14622,9 +14709,9 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
                              : 0x0000FFFF0000FFFFULL;
         FpRegister xsat = broadcast(sat_pattern);
         if (src_bits == 16) {
-          builder_.Gen<x86_64::PminuwXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          GenRaw<x86_64::PminuwXRegXReg>(xn.machine_reg(), xsat.machine_reg());
         } else {
-          builder_.Gen<x86_64::PminudXRegXReg>(xn.machine_reg(), xsat.machine_reg());
+          GenRaw<x86_64::PminudXRegXReg>(xn.machine_reg(), xsat.machine_reg());
         }
       }
 
@@ -14636,11 +14723,11 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
                            : static_cast<int64_t>(0x0D0C090805040100LL);
       FpRegister xmask = AllocTempSimdReg();
       Register gm = std::get<0>(Gen<x86_64::MovqRegImm>(mask_lo));
-      builder_.Gen<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
+      GenRaw<x86_64::MovqXRegReg>(xmask.machine_reg(), gm);
       Register gmhi = std::get<0>(
           Gen<x86_64::MovqRegImm>(static_cast<int64_t>(0x8080808080808080ULL)));
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
-      builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::PinsrqXRegRegImm>(xmask.machine_reg(), gmhi, int8_t{1});
+      GenRaw<x86_64::PshufbXRegXReg>(xn.machine_reg(), xmask.machine_reg());
       if (!args.q) {
         // Q=0: narrowed lanes in the low 64; SetVRegFull zeroes Vd[127:64].
         SetVRegFull(args.rd, xn, /*q=*/false);
@@ -14652,9 +14739,9 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
         FpRegister xd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
         FpRegister xdlow = AllocZeroedSimdReg();
-        builder_.Gen<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
-        builder_.Gen<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::MovsdXRegXReg>(xdlow.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PorXRegXReg>(xdlow.machine_reg(), xn.machine_reg());
         builder_.GenSetSimd<16>(vd_off, xdlow.machine_reg());
       }
       return;
@@ -14673,12 +14760,12 @@ void HeavyOptimizerFrontend::EmitBroadcastVmLane(FpRegister xm, bool is_halfword
   const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
   if (is_halfword) {
     if (index >= 4) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
     }
-    builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
+    GenRaw<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
   } else {
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
   }
 }
 
@@ -14747,8 +14834,8 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
       FpRegister x = AllocTempSimdReg();
       Register gr =
           std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pattern)));
-      builder_.Gen<x86_64::MovqXRegReg>(x.machine_reg(), gr);
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
+      GenRaw<x86_64::MovqXRegReg>(x.machine_reg(), gr);
+      GenRaw<x86_64::PinsrqXRegRegImm>(x.machine_reg(), gr, int8_t{1});
       return x;
     };
 
@@ -14758,47 +14845,47 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_o);
     // Q=1 ("2") selects Vn's upper 64 bits; Vm stays index-selected.
     if (args.q) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{8});
     }
     // Broadcast Vm.lane[index] across every source lane.
     if (args.size == 0b01) {
       if (args.index >= 4) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
       }
       const uint8_t i = args.index & 0b11;
       const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-      builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
+      GenRaw<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
     } else {  // size == 0b10
       const uint8_t i = args.index & 0b11;
       const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
     }
 
     // Compute the doubled, saturated product P into xP.
     FpRegister xP = broadcast(args.size == 0b01 ? uint64_t{0x4000000040000000ULL}
                                                 : uint64_t{0x4000000000000000ULL});
     if (args.size == 0b01) {
-      builder_.Gen<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PadddXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+      GenRaw<x86_64::PmovsxwdXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovsxwdXRegXReg>(xm.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PadddXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
       FpRegister xsat = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
-      builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
     } else {  // size == 0b10
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(xn.machine_reg(), xn.machine_reg());
       // xm is already index-broadcast (all dwords equal); PMULDQ reads dword
       // positions 0 and 2, so no widen of xm is needed.
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqqXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
+      GenRaw<x86_64::PmuldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PcmpeqqXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(xn.machine_reg(), xn.machine_reg());  // double
       FpRegister xsat = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
-      builder_.Gen<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(xsat.machine_reg(), xP.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(xP.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(xP.machine_reg(), xsat.machine_reg());
     }
 
     if (!is_acc) {
@@ -14814,61 +14901,64 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     FpRegister xtmp = AllocTempSimdReg();
     if (args.size == 0b01) {
       if (is_sub) {
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PsubdXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
-        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xres.machine_reg(), xP.machine_reg());  // diff = a - P
+        GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());  // a ^ P
+        GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+        GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
       } else {
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PadddXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
-        builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+        GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xres.machine_reg(), xP.machine_reg());  // sum = a + P
+        GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());  // a ^ sum
+        GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+        GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+        GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
       }
-      builder_.Gen<x86_64::PsradXRegImm>(xof.machine_reg(), int8_t{31});  // overflow lanes
-      builder_.Gen<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});   // a's sign (0 / -1)
+      GenRaw<x86_64::PsradXRegImm>(xof.machine_reg(), int8_t{31});  // overflow lanes
+      GenRaw<x86_64::PsradXRegImm>(xd.machine_reg(), int8_t{31});   // a's sign (0 / -1)
       FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFF7FFFFFFFULL});
-      builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xmaxc.machine_reg());   // sat = (a>>31)^INT32_MAX
-      builder_.Gen<x86_64::PandXRegXReg>(xd.machine_reg(), xof.machine_reg());     // sat in overflow lanes
-      builder_.Gen<x86_64::PandnXRegXReg>(xof.machine_reg(), xres.machine_reg());  // result in non-overflow
-      builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), xof.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(),
+                                   xmaxc.machine_reg());                  // sat = (a>>31)^INT32_MAX
+      GenRaw<x86_64::PandXRegXReg>(xd.machine_reg(), xof.machine_reg());  // sat in overflow lanes
+      GenRaw<x86_64::PandnXRegXReg>(xof.machine_reg(),
+                                    xres.machine_reg());  // result in non-overflow
+      GenRaw<x86_64::PorXRegXReg>(xd.machine_reg(), xof.machine_reg());
       SetVRegFull(args.rd, xd, /*q=*/true);
       return;
     }
     // size == 0b10 accumulate (64-bit signed saturating).
     FpRegister xzero = AllocZeroedSimdReg();
     if (is_sub) {
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PsubqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // diff = a - P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());     // a ^ P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
-      builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PsubqXRegXReg>(xres.machine_reg(), xP.machine_reg());  // diff = a - P
+      GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xP.machine_reg());  // a ^ P
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // a ^ diff
+      GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
     } else {
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PaddqXRegXReg>(xres.machine_reg(), xP.machine_reg());   // sum = a + P
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());   // a ^ sum
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
-      builder_.Gen<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(xres.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PaddqXRegXReg>(xres.machine_reg(), xP.machine_reg());  // sum = a + P
+      GenRaw<x86_64::MovdqaXRegXReg>(xof.machine_reg(), xd.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xof.machine_reg(), xres.machine_reg());  // a ^ sum
+      GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xP.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xtmp.machine_reg(), xres.machine_reg());  // P ^ sum
+      GenRaw<x86_64::PandXRegXReg>(xof.machine_reg(), xtmp.machine_reg());
     }
     // overflow_mask (xtmp) = all-ones per qword where xof < 0 (sign set).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
-    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xtmp.machine_reg(), xof.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xtmp.machine_reg(), xzero.machine_reg());
+    GenRaw<x86_64::PcmpgtqXRegXReg>(xtmp.machine_reg(), xof.machine_reg());
     // sat = sign(a) ^ INT64_MAX  (INT64_MIN if a<0, else INT64_MAX).
-    builder_.Gen<x86_64::PcmpgtqXRegXReg>(xzero.machine_reg(), xd.machine_reg());  // all-ones where a<0
+    GenRaw<x86_64::PcmpgtqXRegXReg>(xzero.machine_reg(), xd.machine_reg());  // all-ones where a<0
     FpRegister xmaxc = broadcast(uint64_t{0x7FFFFFFFFFFFFFFFULL});
-    builder_.Gen<x86_64::PxorXRegXReg>(xzero.machine_reg(), xmaxc.machine_reg());  // xzero = sat value
-    builder_.Gen<x86_64::PandXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());   // sat in overflow lanes
-    builder_.Gen<x86_64::PandnXRegXReg>(xtmp.machine_reg(), xres.machine_reg());   // result in non-overflow
-    builder_.Gen<x86_64::PorXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xzero.machine_reg(), xmaxc.machine_reg());  // xzero = sat value
+    GenRaw<x86_64::PandXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());  // sat in overflow lanes
+    GenRaw<x86_64::PandnXRegXReg>(xtmp.machine_reg(),
+                                  xres.machine_reg());  // result in non-overflow
+    GenRaw<x86_64::PorXRegXReg>(xzero.machine_reg(), xtmp.machine_reg());
     SetVRegFull(args.rd, xzero, /*q=*/true);
     return;
   }
@@ -14923,35 +15013,35 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     builder_.GenGetSimd<16>(wn.machine_reg(), w_vn_off);
     // Bring Vn's selected source half (Q=1 -> bytes 8..15) into the low quad.
     if (args.q) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(wn.machine_reg(), int8_t{8});
+      GenRaw<x86_64::PsrldqXRegImm>(wn.machine_reg(), int8_t{8});
     }
 
     if (args.size == 0b01) {
       // Broadcast Vm.h[index] across all 8 halfword lanes.
       if (args.index >= 4) {
-        builder_.Gen<x86_64::PsrldqXRegImm>(wm.machine_reg(), int8_t{8});
+        GenRaw<x86_64::PsrldqXRegImm>(wm.machine_reg(), int8_t{8});
       }
       const uint8_t i = args.index & 0b11;
       const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-      builder_.Gen<x86_64::PshuflwXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), int8_t{0x44});
+      GenRaw<x86_64::PshuflwXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), int8_t{0x44});
       // Widen low 4 halfwords of each source to 4 x 32-bit lanes.
       if (w_signed) {
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
-        builder_.Gen<x86_64::PmovsxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
+        GenRaw<x86_64::PmovsxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
-        builder_.Gen<x86_64::PmovzxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(wm.machine_reg(), wm.machine_reg());
+        GenRaw<x86_64::PmovzxwdXRegXReg>(wn.machine_reg(), wn.machine_reg());
       }
-      builder_.Gen<x86_64::PmulldXRegXReg>(wn.machine_reg(), wm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(wn.machine_reg(), wm.machine_reg());
       FpRegister w_result = wn;
       if (w_accum) {
         FpRegister wd = AllocTempSimdReg();
         builder_.GenGetSimd<16>(wd.machine_reg(), w_vd_off);
         if (w_sub) {
-          builder_.Gen<x86_64::PsubdXRegXReg>(wd.machine_reg(), wn.machine_reg());
+          GenRaw<x86_64::PsubdXRegXReg>(wd.machine_reg(), wn.machine_reg());
         } else {
-          builder_.Gen<x86_64::PadddXRegXReg>(wd.machine_reg(), wn.machine_reg());
+          GenRaw<x86_64::PadddXRegXReg>(wd.machine_reg(), wn.machine_reg());
         }
         w_result = wd;
       }
@@ -14965,23 +15055,23 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     {
       const uint8_t i = args.index & 0b11;
       const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(wm.machine_reg(), wm.machine_reg(), imm);
     }
     if (w_signed) {
-      builder_.Gen<x86_64::PmovsxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
-      builder_.Gen<x86_64::PmuldqXRegXReg>(wn.machine_reg(), wm.machine_reg());
+      GenRaw<x86_64::PmovsxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
+      GenRaw<x86_64::PmuldqXRegXReg>(wn.machine_reg(), wm.machine_reg());
     } else {
-      builder_.Gen<x86_64::PmovzxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
-      builder_.Gen<x86_64::PmuludqXRegXReg>(wn.machine_reg(), wm.machine_reg());
+      GenRaw<x86_64::PmovzxdqXRegXReg>(wn.machine_reg(), wn.machine_reg());
+      GenRaw<x86_64::PmuludqXRegXReg>(wn.machine_reg(), wm.machine_reg());
     }
     FpRegister w_result = wn;
     if (w_accum) {
       FpRegister wd = AllocTempSimdReg();
       builder_.GenGetSimd<16>(wd.machine_reg(), w_vd_off);
       if (w_sub) {
-        builder_.Gen<x86_64::PsubqXRegXReg>(wd.machine_reg(), wn.machine_reg());
+        GenRaw<x86_64::PsubqXRegXReg>(wd.machine_reg(), wn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PaddqXRegXReg>(wd.machine_reg(), wn.machine_reg());
+        GenRaw<x86_64::PaddqXRegXReg>(wd.machine_reg(), wn.machine_reg());
       }
       w_result = wd;
     }
@@ -15044,19 +15134,19 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
       // FP64: index 0 -> 0x44 (copies low qword), index 1 -> 0xEE (high qword).
       const int8_t imm =
           (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
     } else {
       const uint8_t i = args.index & 0b11;
       const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
+      GenRaw<x86_64::PshufdXRegXRegImm>(fxm.machine_reg(), fxm.machine_reg(), imm);
     }
 
     FpRegister fp_result = fxn;
     if (args.opcode == Op::kFmul) {
       if (fp_is_double) {
-        builder_.Gen<x86_64::MulpdXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::MulpdXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
       } else {
-        builder_.Gen<x86_64::MulpsXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::MulpsXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
       }
     } else if (args.opcode == Op::kFmulx) {
       // FMULX = FMUL except (+/-0 * +/-inf) lanes return +/-2.0 (sign =
@@ -15070,40 +15160,40 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
       //   two_signed  = ((a XOR broadcast_b) AND sign_mask) OR bits(+2.0)
       //   result      = (mul AND NOT special) OR (two_signed AND special)
       FpRegister mul = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), fxn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mul.machine_reg(), fxn.machine_reg());
       if (fp_is_double) {
-        builder_.Gen<x86_64::MulpdXRegXReg>(mul.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::MulpdXRegXReg>(mul.machine_reg(), fxm.machine_reg());
       } else {
-        builder_.Gen<x86_64::MulpsXRegXReg>(mul.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::MulpsXRegXReg>(mul.machine_reg(), fxm.machine_reg());
       }
       // mul_unord = cmpunord(mul, mul).
       FpRegister mul_unord = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
       if (fp_is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+        GenRaw<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
       }
       // special = input_unord = cmpunord(a, broadcast_b), then
       // special = mul_unord AND NOT input_unord (Pandn writes (NOT dst) AND src).
       FpRegister special = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), fxn.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(special.machine_reg(), fxn.machine_reg());
       if (fp_is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(special.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::CmpunordpdXRegXReg>(special.machine_reg(), fxm.machine_reg());
       } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), fxm.machine_reg());
+        GenRaw<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), fxm.machine_reg());
       }
-      builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
       // two_signed: reuse fxn as (a XOR broadcast_b); reuse mul_unord as the
       // per-lane sign mask (all-ones << 31/63).  Bitwise XOR == XORPS/XORPD.
-      builder_.Gen<x86_64::PxorXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(fxn.machine_reg(), fxm.machine_reg());
+      GenRaw<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
       if (fp_is_double) {
-        builder_.Gen<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
+        GenRaw<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
       } else {
-        builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+        GenRaw<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
       }
-      builder_.Gen<x86_64::PandXRegXReg>(fxn.machine_reg(), mul_unord.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(fxn.machine_reg(), mul_unord.machine_reg());
       // Broadcast bits of +2.0 into all lanes (FP64: 0x4000000000000000 per
       // qword; FP32: 0x40000000 per dword = 0x4000000040000000 per qword).
       FpRegister two = AllocTempSimdReg();
@@ -15112,34 +15202,34 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
                                           : uint64_t{0x4000000040000000ULL};
         Register gr =
             std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pat)));
-        builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), gr);
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(two.machine_reg(), gr, int8_t{1});
+        GenRaw<x86_64::MovqXRegReg>(two.machine_reg(), gr);
+        GenRaw<x86_64::PinsrqXRegRegImm>(two.machine_reg(), gr, int8_t{1});
       }
-      builder_.Gen<x86_64::PorXRegXReg>(fxn.machine_reg(), two.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(fxn.machine_reg(), two.machine_reg());
       // fxn now holds +/-2.0 per lane.  Blend:
       //   result = (mul AND NOT special) OR (+/-2.0 AND special).
-      builder_.Gen<x86_64::PandXRegXReg>(fxn.machine_reg(), special.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(special.machine_reg(), fxn.machine_reg());
+      GenRaw<x86_64::PandXRegXReg>(fxn.machine_reg(), special.machine_reg());
+      GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+      GenRaw<x86_64::PorXRegXReg>(special.machine_reg(), fxn.machine_reg());
       fp_result = special;
     } else {
       FpRegister fxd = AllocTempSimdReg();
       builder_.GenGetSimd<16>(fxd.machine_reg(), fp_vd_off);
       if (args.opcode == Op::kFmla) {
         if (fp_is_double) {
-          builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfmadd231pdXRegXRegXReg>(
               fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
         } else {
-          builder_.Gen<x86_64::Vfmadd231psXRegXRegXReg>(
+          GenRaw<x86_64::Vfmadd231psXRegXRegXReg>(
               fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
         }
       } else {
         // FMLS: Vd = Vd + (-Vn)*Vm -- single fused rounding.
         if (fp_is_double) {
-          builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(
+          GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
               fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
         } else {
-          builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(
+          GenRaw<x86_64::Vfnmadd231psXRegXRegXReg>(
               fxd.machine_reg(), fxn.machine_reg(), fxm.machine_reg());
         }
       }
@@ -15191,29 +15281,29 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
   FpRegister result = xn;
   if (args.opcode == Op::kMul) {
     if (is_halfword) {
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
     }
   } else {
     FpRegister xd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
     if (is_halfword) {
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmullwXRegXReg>(xn.machine_reg(), xm.machine_reg());
     } else {
-      builder_.Gen<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PmulldXRegXReg>(xn.machine_reg(), xm.machine_reg());
     }
     if (args.opcode == Op::kMla) {
       if (is_halfword) {
-        builder_.Gen<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PaddwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PadddXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
     } else {
       if (is_halfword) {
-        builder_.Gen<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubwXRegXReg>(xd.machine_reg(), xn.machine_reg());
       } else {
-        builder_.Gen<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
+        GenRaw<x86_64::PsubdXRegXReg>(xd.machine_reg(), xn.machine_reg());
       }
     }
     result = xd;
@@ -15257,62 +15347,80 @@ void HeavyOptimizerFrontend::AdvSimdScalarXIndexedElement(const Decoder::AdvSimd
   if (is_double) {
     const int8_t imm =
         (args.index == 0) ? int8_t{0x44} : int8_t{static_cast<int8_t>(0xEEu)};
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
   } else {
     const uint8_t i = args.index & 0b11;
     const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
   }
   FpRegister result = xn;
   if (args.opcode == Op::kFmul) {
-    if (is_double) builder_.Gen<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
-    else builder_.Gen<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::MulpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    else
+      GenRaw<x86_64::MulpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
   } else if (args.opcode == Op::kFmulx) {
     // FMULX = FMUL except (+/-0 * +/-inf) lanes return +/-2.0 (sign =
     // sign(a) XOR sign(b)). Line-by-line lift of the vector by-element FMULX
     // saturation blend on top of the already-broadcast Vm lane (xm).
     FpRegister mul = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mul.machine_reg(), xn.machine_reg());
-    if (is_double) builder_.Gen<x86_64::MulpdXRegXReg>(mul.machine_reg(), xm.machine_reg());
-    else builder_.Gen<x86_64::MulpsXRegXReg>(mul.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mul.machine_reg(), xn.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::MulpdXRegXReg>(mul.machine_reg(), xm.machine_reg());
+    else
+      GenRaw<x86_64::MulpsXRegXReg>(mul.machine_reg(), xm.machine_reg());
     FpRegister mul_unord = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
-    if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
-    else builder_.Gen<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(mul_unord.machine_reg(), mul.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::CmpunordpdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+    else
+      GenRaw<x86_64::CmpunordpsXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
     FpRegister special = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdqaXRegXReg>(special.machine_reg(), xn.machine_reg());
-    if (is_double) builder_.Gen<x86_64::CmpunordpdXRegXReg>(special.machine_reg(), xm.machine_reg());
-    else builder_.Gen<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(special.machine_reg(), xn.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::CmpunordpdXRegXReg>(special.machine_reg(), xm.machine_reg());
+    else
+      GenRaw<x86_64::CmpunordpsXRegXReg>(special.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul_unord.machine_reg());
     // two_signed: reuse xn as (a XOR b); reuse mul_unord as the sign mask.
-    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
-    builder_.Gen<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
-    if (is_double) builder_.Gen<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
-    else builder_.Gen<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
-    builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), mul_unord.machine_reg());
+    GenRaw<x86_64::PxorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PcmpeqdXRegXReg>(mul_unord.machine_reg(), mul_unord.machine_reg());
+    if (is_double)
+      GenRaw<x86_64::PsllqXRegImm>(mul_unord.machine_reg(), int8_t{63});
+    else
+      GenRaw<x86_64::PslldXRegImm>(mul_unord.machine_reg(), int8_t{31});
+    GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), mul_unord.machine_reg());
     FpRegister two = AllocTempSimdReg();
     {
       const uint64_t pat = is_double ? uint64_t{0x4000000000000000ULL}
                                      : uint64_t{0x4000000040000000ULL};
       Register gr = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(pat)));
-      builder_.Gen<x86_64::MovqXRegReg>(two.machine_reg(), gr);
-      builder_.Gen<x86_64::PinsrqXRegRegImm>(two.machine_reg(), gr, int8_t{1});
+      GenRaw<x86_64::MovqXRegReg>(two.machine_reg(), gr);
+      GenRaw<x86_64::PinsrqXRegRegImm>(two.machine_reg(), gr, int8_t{1});
     }
-    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), two.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), two.machine_reg());
     // Blend: result = (mul AND NOT special) OR (+/-2.0 AND special).
-    builder_.Gen<x86_64::PandXRegXReg>(xn.machine_reg(), special.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(special.machine_reg(), xn.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xn.machine_reg(), special.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(special.machine_reg(), mul.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(special.machine_reg(), xn.machine_reg());
     result = special;
   } else {
     FpRegister xd = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xd.machine_reg(), GetVRegOffset(args.rd));
     if (args.opcode == Op::kFmla) {
-      if (is_double) builder_.Gen<x86_64::Vfmadd231pdXRegXRegXReg>(xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
-      else builder_.Gen<x86_64::Vfmadd231psXRegXRegXReg>(xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::Vfmadd231pdXRegXRegXReg>(
+            xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+      else
+        GenRaw<x86_64::Vfmadd231psXRegXRegXReg>(
+            xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
     } else {  // FMLS: Vd = Vd + (-Vn)*Vm, single fused rounding.
-      if (is_double) builder_.Gen<x86_64::Vfnmadd231pdXRegXRegXReg>(xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
-      else builder_.Gen<x86_64::Vfnmadd231psXRegXRegXReg>(xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+      if (is_double)
+        GenRaw<x86_64::Vfnmadd231pdXRegXRegXReg>(
+            xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
+      else
+        GenRaw<x86_64::Vfnmadd231psXRegXRegXReg>(
+            xd.machine_reg(), xn.machine_reg(), xm.machine_reg());
     }
     result = xd;
   }
@@ -15345,9 +15453,9 @@ void HeavyOptimizerFrontend::AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, 
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
     // Concatenate Vn.low64 (bytes 0..7) with Vm.low64 (bytes 8..15); the
     // upper 64 of Vn/Vm never participate in the Q=0 window.
-    builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
     if (index != 0) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
     }
     // The wanted 8-byte window sits in the low 64 bits; SetVRegFull(q=false)
     // zero-extends the upper 64.
@@ -15368,9 +15476,9 @@ void HeavyOptimizerFrontend::AdvSimdExtract(uint8_t rd, uint8_t rn, uint8_t rm, 
   FpRegister xm = AllocTempSimdReg();
   builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
   // result = (Vn >> index bytes) | (Vm << (16-index) bytes).
-  builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
-  builder_.Gen<x86_64::PslldqXRegImm>(xm.machine_reg(), static_cast<int8_t>(16 - index));
-  builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+  GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), static_cast<int8_t>(index));
+  GenRaw<x86_64::PslldqXRegImm>(xm.machine_reg(), static_cast<int8_t>(16 - index));
+  GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
   SetVRegFull(rd, xn, /*q=*/true);
 }
 
@@ -15419,22 +15527,38 @@ void HeavyOptimizerFrontend::AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, 
     if (!q && is_zip2) {
       // Shift each source right by 4 bytes so the (originally upper-half)
       // bytes 4..7 land at positions 0..3; PUNPCKL then picks them up.
-      builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+      GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+      GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
     }
     if (q && is_zip2) {
       switch (size) {
-        case 0b00: builder_.Gen<x86_64::PunpckhbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b01: builder_.Gen<x86_64::PunpckhwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b10: builder_.Gen<x86_64::PunpckhdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b11: builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        case 0b00:
+          GenRaw<x86_64::PunpckhbwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b01:
+          GenRaw<x86_64::PunpckhwdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b10:
+          GenRaw<x86_64::PunpckhdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b11:
+          GenRaw<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
       }
     } else {
       switch (size) {
-        case 0b00: builder_.Gen<x86_64::PunpcklbwXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b01: builder_.Gen<x86_64::PunpcklwdXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b10: builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
-        case 0b11: builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg()); break;
+        case 0b00:
+          GenRaw<x86_64::PunpcklbwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b01:
+          GenRaw<x86_64::PunpcklwdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b10:
+          GenRaw<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
+        case 0b11:
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          break;
       }
     }
   } else if (is_uzp) {
@@ -15443,46 +15567,46 @@ void HeavyOptimizerFrontend::AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, 
       // Combine the lower 8 bytes of Vn and Vm into xn = [vn_lo | vm_lo] so
       // subsequent PACKUS/SHUFPS consumes a single source; the Q=0 tail then
       // discards the duplicated high half.
-      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
     }
     switch (size) {
       case 0b00: {  // .16B (q=1) or .8B (q=0). PACKUSWB.
         if (is_uzp2) {
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
         } else {
-          builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
-          builder_.Gen<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{8});
+          GenRaw<x86_64::PsrlwXRegImm>(xn.machine_reg(), int8_t{8});
         }
         if (q) {
           if (is_uzp2) {
-            builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
           } else {
-            builder_.Gen<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
-            builder_.Gen<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PsllwXRegImm>(xm.machine_reg(), int8_t{8});
+            GenRaw<x86_64::PsrlwXRegImm>(xm.machine_reg(), int8_t{8});
           }
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PackuswbXRegXReg>(xn.machine_reg(), xn.machine_reg());
         }
         break;
       }
       case 0b01: {  // .8H (q=1) or .4H (q=0). PACKUSDW (SSE4.1).
         if (is_uzp2) {
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
         } else {
-          builder_.Gen<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
-          builder_.Gen<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
+          GenRaw<x86_64::PslldXRegImm>(xn.machine_reg(), int8_t{16});
+          GenRaw<x86_64::PsrldXRegImm>(xn.machine_reg(), int8_t{16});
         }
         if (q) {
           if (is_uzp2) {
-            builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
           } else {
-            builder_.Gen<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
-            builder_.Gen<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
+            GenRaw<x86_64::PslldXRegImm>(xm.machine_reg(), int8_t{16});
+            GenRaw<x86_64::PsrldXRegImm>(xm.machine_reg(), int8_t{16});
           }
-          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn.machine_reg());
+          GenRaw<x86_64::PackusdwXRegXReg>(xn.machine_reg(), xn.machine_reg());
         }
         break;
       }
@@ -15490,19 +15614,19 @@ void HeavyOptimizerFrontend::AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, 
         const int8_t imm =
             is_uzp2 ? static_cast<int8_t>(0xDD) : static_cast<int8_t>(0x88);
         if (q) {
-          builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xm.machine_reg(), imm);
+          GenRaw<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xm.machine_reg(), imm);
         } else {
           // xn already holds [vn_lo | vm_lo] from PUNPCKLQDQ above.
-          builder_.Gen<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+          GenRaw<x86_64::ShufpsXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
         }
         break;
       }
       case 0b11: {  // .2D (q=1 only; q=0 caught above).
         // UZP1.2D == ZIP1.2D, UZP2.2D == ZIP2.2D (2-lane coincidence).
         if (is_uzp2) {
-          builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       }
@@ -15545,17 +15669,15 @@ void HeavyOptimizerFrontend::AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, 
         }
         FpRegister mask_n = AllocTempSimdReg();
         FpRegister mask_m = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovqXRegReg>(mask_n.machine_reg(),
-                                          GetImm(static_cast<uint64_t>(mask_n_lo)));
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_n.machine_reg(),
-                                               GetImm(static_cast<uint64_t>(mask_n_hi)), int8_t{1});
-        builder_.Gen<x86_64::MovqXRegReg>(mask_m.machine_reg(),
-                                          GetImm(static_cast<uint64_t>(mask_m_lo)));
-        builder_.Gen<x86_64::PinsrqXRegRegImm>(mask_m.machine_reg(),
-                                               GetImm(static_cast<uint64_t>(mask_m_hi)), int8_t{1});
-        builder_.Gen<x86_64::PshufbXRegXReg>(xn.machine_reg(), mask_n.machine_reg());
-        builder_.Gen<x86_64::PshufbXRegXReg>(xm.machine_reg(), mask_m.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
+        GenRaw<x86_64::MovqXRegReg>(mask_n.machine_reg(), GetImm(static_cast<uint64_t>(mask_n_lo)));
+        GenRaw<x86_64::PinsrqXRegRegImm>(
+            mask_n.machine_reg(), GetImm(static_cast<uint64_t>(mask_n_hi)), int8_t{1});
+        GenRaw<x86_64::MovqXRegReg>(mask_m.machine_reg(), GetImm(static_cast<uint64_t>(mask_m_lo)));
+        GenRaw<x86_64::PinsrqXRegRegImm>(
+            mask_m.machine_reg(), GetImm(static_cast<uint64_t>(mask_m_hi)), int8_t{1});
+        GenRaw<x86_64::PshufbXRegXReg>(xn.machine_reg(), mask_n.machine_reg());
+        GenRaw<x86_64::PshufbXRegXReg>(xm.machine_reg(), mask_m.machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(xn.machine_reg(), xm.machine_reg());
         break;
       }
       case 0b10: {  // .4S (q=1) or .2S (q=0).
@@ -15563,28 +15685,28 @@ void HeavyOptimizerFrontend::AdvSimdPermute(uint8_t rd, uint8_t rn, uint8_t rm, 
           // TRN1.2S == ZIP1.2S = [s1[0], s2[0]]; TRN2.2S == ZIP2.2S =
           // [s1[1], s2[1]] (PSRLDQ-4 prelude pulls lane 1 down to 0).
           if (is_trn2) {
-            builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
-            builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
+            GenRaw<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{4});
+            GenRaw<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{4});
           }
-          builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
           // PSHUFD imm 0x88 (even) / 0xDD (odd) collapses each source's
           // wanted dwords into both halves; PUNPCKLDQ interleaves the lows:
           //   res = [s1[0], s2[0], s1[2], s2[2]] = TRN1.4S (0x88), etc.
           const int8_t imm = is_trn2 ? static_cast<int8_t>(0xDD)
                                      : static_cast<int8_t>(0x88);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
-          builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-          builder_.Gen<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(), imm);
+          GenRaw<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+          GenRaw<x86_64::PunpckldqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       }
       case 0b11: {  // .2D (q=1 only; q=0 caught above).
         // TRN1.2D == ZIP1.2D, TRN2.2D == ZIP2.2D (2-lane coincidence).
         if (is_trn2) {
-          builder_.Gen<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpckhqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         } else {
-          builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
+          GenRaw<x86_64::PunpcklqdqXRegXReg>(xn.machine_reg(), xm.machine_reg());
         }
         break;
       }
@@ -15622,50 +15744,48 @@ void HeavyOptimizerFrontend::AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t 
   // acc = 0, in_range = 0, zero = 0. MOVQ from a zero GP reg zero-extends to a
   // full 128-bit zero and is a proper full-def (a self-PXOR would read an
   // undefined vreg and trip the lifetime analysis in this tier).
-  builder_.Gen<x86_64::MovqXRegReg>(xmm_acc.machine_reg(), GetImm(uint64_t{0}));
-  builder_.Gen<x86_64::MovqXRegReg>(xmm_in_range.machine_reg(), GetImm(uint64_t{0}));
-  builder_.Gen<x86_64::MovqXRegReg>(xmm_zero.machine_reg(), GetImm(uint64_t{0}));
+  GenRaw<x86_64::MovqXRegReg>(xmm_acc.machine_reg(), GetImm(uint64_t{0}));
+  GenRaw<x86_64::MovqXRegReg>(xmm_in_range.machine_reg(), GetImm(uint64_t{0}));
+  GenRaw<x86_64::MovqXRegReg>(xmm_zero.machine_reg(), GetImm(uint64_t{0}));
   // const15 = byte-broadcast(0x0F).
-  builder_.Gen<x86_64::MovqXRegReg>(xmm_const15.machine_reg(),
-                                    GetImm(uint64_t{0x0F0F0F0F0F0F0F0FULL}));
-  builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_const15.machine_reg(), xmm_const15.machine_reg());
+  GenRaw<x86_64::MovqXRegReg>(xmm_const15.machine_reg(), GetImm(uint64_t{0x0F0F0F0F0F0F0F0FULL}));
+  GenRaw<x86_64::PunpcklqdqXRegXReg>(xmm_const15.machine_reg(), xmm_const15.machine_reg());
 
   for (uint8_t r = 0; r < table_regs; ++r) {
     const int32_t vn_off_r =
         GetVRegOffset(((rn + r) & 31));
 
     // shifted_idx_r = Vm - r*16 (bytewise wrap). For r=0 this is just Vm.
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_idx.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_idx.machine_reg());
     if (r != 0) {
       const uint64_t broadcast =
           uint64_t{0x0101010101010101ULL} * static_cast<uint64_t>(r * 16);
-      builder_.Gen<x86_64::MovqXRegReg>(xmm_tmp_mask.machine_reg(), GetImm(broadcast));
-      builder_.Gen<x86_64::PunpcklqdqXRegXReg>(xmm_tmp_mask.machine_reg(),
-                                               xmm_tmp_mask.machine_reg());
-      builder_.Gen<x86_64::PsubbXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_tmp_mask.machine_reg());
+      GenRaw<x86_64::MovqXRegReg>(xmm_tmp_mask.machine_reg(), GetImm(broadcast));
+      GenRaw<x86_64::PunpcklqdqXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_mask.machine_reg());
+      GenRaw<x86_64::PsubbXRegXReg>(xmm_tmp_idx.machine_reg(), xmm_tmp_mask.machine_reg());
     }
 
     // in_range_r = PCMPEQB(PSUBUSB(shifted_idx_r, 15), 0).
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_idx.machine_reg());
-    builder_.Gen<x86_64::PsubusbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_const15.machine_reg());
-    builder_.Gen<x86_64::PcmpeqbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_zero.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_idx.machine_reg());
+    GenRaw<x86_64::PsubusbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_const15.machine_reg());
+    GenRaw<x86_64::PcmpeqbXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_zero.machine_reg());
 
     // looked_up_r = PSHUFB(V[(rn+r)%32], shifted_idx_r), masked by in_range.
     builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vn_off_r);
-    builder_.Gen<x86_64::PshufbXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_idx.machine_reg());
-    builder_.Gen<x86_64::PandXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_mask.machine_reg());
+    GenRaw<x86_64::PshufbXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_idx.machine_reg());
+    GenRaw<x86_64::PandXRegXReg>(xmm_tmp_lookup.machine_reg(), xmm_tmp_mask.machine_reg());
 
-    builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_lookup.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xmm_in_range.machine_reg(), xmm_tmp_mask.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_lookup.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xmm_in_range.machine_reg(), xmm_tmp_mask.machine_reg());
   }
 
   if (op /* TBX */) {
     // result = acc | (Vd & ~in_range_all).
     builder_.GenGetSimd<16>(xmm_tmp_lookup.machine_reg(), vd_off);
     // xmm_tmp_mask := ~in_range_all & Vd
-    builder_.Gen<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_in_range.machine_reg());
-    builder_.Gen<x86_64::PandnXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_lookup.machine_reg());
-    builder_.Gen<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_mask.machine_reg());
+    GenRaw<x86_64::MovdqaXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_in_range.machine_reg());
+    GenRaw<x86_64::PandnXRegXReg>(xmm_tmp_mask.machine_reg(), xmm_tmp_lookup.machine_reg());
+    GenRaw<x86_64::PorXRegXReg>(xmm_acc.machine_reg(), xmm_tmp_mask.machine_reg());
   }
 
   // SetVRegFull zeroes Vd[127:64] when q=false (D-register semantics).
@@ -15735,10 +15855,10 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
         return std::nullopt;
       }
       FpRegister part = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(part.machine_reg(), src.machine_reg());
+      GenRaw<x86_64::MovdqaXRegXReg>(part.machine_reg(), src.machine_reg());
       Register mask_addr = GetImm(reinterpret_cast<uint64_t>(mask.bytes));
       FpRegister xmask{std::get<0>(Gen<x86_64::MovdqaXRegOp>({.base = mask_addr, .disp = 0}))};
-      builder_.Gen<x86_64::PshufbXRegXReg>(part.machine_reg(), xmask.machine_reg());
+      GenRaw<x86_64::PshufbXRegXReg>(part.machine_reg(), xmask.machine_reg());
       return part;
     };
     auto combine = [&](std::optional<FpRegister>& acc, std::optional<FpRegister> part) {
@@ -15748,7 +15868,7 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
       if (!acc) {
         acc = part;
       } else {
-        builder_.Gen<x86_64::PorXRegXReg>(acc->machine_reg(), part->machine_reg());
+        GenRaw<x86_64::PorXRegXReg>(acc->machine_reg(), part->machine_reg());
       }
     };
 
@@ -15766,11 +15886,9 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
         CHECK(chunk.has_value());
         const int32_t mem_off = 16 * j;
         if (total_bytes - mem_off >= 16) {
-          builder_.Gen<x86_64::MovdquOpXReg>({.base = ibase, .disp = mem_off},
-                                             chunk->machine_reg());
+          GenRaw<x86_64::MovdquOpXReg>({.base = ibase, .disp = mem_off}, chunk->machine_reg());
         } else {
-          builder_.Gen<x86_64::MovsdOpXReg>({.base = ibase, .disp = mem_off},
-                                            chunk->machine_reg());
+          GenRaw<x86_64::MovsdOpXReg>({.base = ibase, .disp = mem_off}, chunk->machine_reg());
         }
         GenRecoveryBlockForLastInsn();
       }
@@ -15834,10 +15952,10 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
       FpRegister xmm = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
       if (q) {
-        builder_.Gen<x86_64::MovdquOpXReg>({.base = base, .disp = mem_off}, xmm.machine_reg());
+        GenRaw<x86_64::MovdquOpXReg>({.base = base, .disp = mem_off}, xmm.machine_reg());
       } else {
         // Q=0: store the low 64 bits of V[vreg].
-        builder_.Gen<x86_64::MovsdOpXReg>({.base = base, .disp = mem_off}, xmm.machine_reg());
+        GenRaw<x86_64::MovsdOpXReg>({.base = base, .disp = mem_off}, xmm.machine_reg());
       }
       GenRecoveryBlockForLastInsn();
     } else {
@@ -15952,11 +16070,11 @@ void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
       builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
       FpRegister xn = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.Gen<x86_64::PxorXRegXReg>(xd.machine_reg(), xn.machine_reg());
+      GenRaw<x86_64::PxorXRegXReg>(xd.machine_reg(), xn.machine_reg());
       if (opcode == 0b00) {
-        builder_.Gen<x86_64::AesenclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+        GenRaw<x86_64::AesenclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
       } else {
-        builder_.Gen<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+        GenRaw<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
       }
       result = xd;
       break;
@@ -15964,8 +16082,8 @@ void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
     case 0b10: {    // AESMC = AESENC(AESDECLAST(Vn, 0), 0)
       FpRegister xd = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xd.machine_reg(), vn_off);
-      builder_.Gen<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
-      builder_.Gen<x86_64::AesencXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      GenRaw<x86_64::AesdeclastXRegXReg>(xd.machine_reg(), zero.machine_reg());
+      GenRaw<x86_64::AesencXRegXReg>(xd.machine_reg(), zero.machine_reg());
       result = xd;
       break;
     }
@@ -16062,10 +16180,10 @@ struct HeavyOptimizerFrontend::Sha256Ops {
 
   FpRegister Pack(Register w0, Register w1, Register w2, Register w3) {
     FpRegister x = self->AllocTempSimdReg();
-    self->builder_.Gen<x86_64::MovdXRegReg>(x.machine_reg(), w0);
-    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w1, int8_t{1});
-    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w2, int8_t{2});
-    self->builder_.Gen<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w3, int8_t{3});
+    self->GenRaw<x86_64::MovdXRegReg>(x.machine_reg(), w0);
+    self->GenRaw<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w1, int8_t{1});
+    self->GenRaw<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w2, int8_t{2});
+    self->GenRaw<x86_64::PinsrdXRegRegImm>(x.machine_reg(), w3, int8_t{3});
     return x;
   }
 };
@@ -16176,7 +16294,7 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
     // SHA1H: Sd = ROL(Sn, 30), upper 96 bits zeroed (MOVD zero-extends).
     Register r = op.Rotr(op.Lane(vn, 0), 2);
     FpRegister res = AllocTempSimdReg();
-    builder_.Gen<x86_64::MovdXRegReg>(res.machine_reg(), r);
+    GenRaw<x86_64::MovdXRegReg>(res.machine_reg(), r);
     SetVRegFull(rd, res, /*q=*/true);
     return;
   }
@@ -16311,12 +16429,11 @@ void HeavyOptimizerFrontend::SetVRegScalar(uint8_t reg, FpRegister value, bool i
   const int32_t off = GetVRegOffset(reg);
   FpRegister merged = AllocZeroedSimdReg();
   if (is_double) {
-    builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
+    GenRaw<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
   } else {
-    builder_.Gen<x86_64::MovssXRegXReg>(merged.machine_reg(), value.machine_reg());
+    GenRaw<x86_64::MovssXRegXReg>(merged.machine_reg(), value.machine_reg());
   }
-  builder_.Gen<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off},
-                                     merged.machine_reg());
+  GenRaw<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off}, merged.machine_reg());
 }
 
 // Write a scalar value held in a GP register (low 4 bytes for S, low 8 for D)
@@ -16330,13 +16447,12 @@ void HeavyOptimizerFrontend::SetVRegScalarFromGp(uint8_t reg, Register value, bo
   FpRegister merged = AllocZeroedSimdReg();
   if (is_double) {
     // MOVQ xmm, r64 zero-extends into the XMM (upper 64 cleared).
-    builder_.Gen<x86_64::MovqXRegReg>(merged.machine_reg(), value);
+    GenRaw<x86_64::MovqXRegReg>(merged.machine_reg(), value);
   } else {
     // MOVD xmm, r32 zero-extends into the XMM (upper 96 cleared).
-    builder_.Gen<x86_64::MovdXRegReg>(merged.machine_reg(), value);
+    GenRaw<x86_64::MovdXRegReg>(merged.machine_reg(), value);
   }
-  builder_.Gen<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off},
-                                     merged.machine_reg());
+  GenRaw<x86_64::MovdqaOpXReg>({.base = x86_64::kMachineRegRBP, .disp = off}, merged.machine_reg());
 }
 
 // Write a full or D-form vector result to guest V[reg]. For the Q-form
@@ -16359,7 +16475,7 @@ void HeavyOptimizerFrontend::SetVRegFull(uint8_t reg, FpRegister value, bool q) 
     return;
   }
   FpRegister merged = AllocZeroedSimdReg();
-  builder_.Gen<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
+  GenRaw<x86_64::MovsdXRegXReg>(merged.machine_reg(), value.machine_reg());
   builder_.GenSetSimd<16>(off, merged.machine_reg());
 }
 
@@ -16377,12 +16493,12 @@ void HeavyOptimizerFrontend::SetVRegNarrow(uint8_t rd, FpRegister narrowed, bool
     return;
   }
   const int32_t vd_off = GetVRegOffset(rd);
-  builder_.Gen<x86_64::PslldqXRegImm>(narrowed.machine_reg(), int8_t{8});
+  GenRaw<x86_64::PslldqXRegImm>(narrowed.machine_reg(), int8_t{8});
   FpRegister xd = AllocTempSimdReg();
   FpRegister xd_low = AllocZeroedSimdReg();
   builder_.GenGetSimd<16>(xd.machine_reg(), vd_off);
-  builder_.Gen<x86_64::MovsdXRegXReg>(xd_low.machine_reg(), xd.machine_reg());
-  builder_.Gen<x86_64::PorXRegXReg>(narrowed.machine_reg(), xd_low.machine_reg());
+  GenRaw<x86_64::MovsdXRegXReg>(xd_low.machine_reg(), xd.machine_reg());
+  GenRaw<x86_64::PorXRegXReg>(narrowed.machine_reg(), xd_low.machine_reg());
   SetVRegFull(rd, narrowed, /*q=*/true);
 }
 
