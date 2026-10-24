@@ -36,7 +36,6 @@
 #include "berberis/runtime_primitives/platform.h"
 
 #include "inline_intrinsic.h"
-#include "machine_insn_adapter.h"
 #include "simd_register.h"
 
 namespace berberis {
@@ -614,99 +613,36 @@ class HeavyOptimizerFrontend {
     return static_cast<int32_t>(GetThreadStateSimdRegOffset(static_cast<int>(reg)));
   }
 
-  // Syntax sugar mirroring riscv64's Gen<> adapter. It threads guest temp
-  // registers through Copy for SSA form and dispatches to the
-  // MachineIRBuilder.
-  enum SSAMode { kSSA, kNoSSA };
-
-  template <typename InsnType, enum SSAMode kSSAMode = kSSA, typename... Args>
-  auto Gen(Args... args)
-      -> std::enable_if_t<(std::is_same_v<std::remove_cvref_t<Args>, MachineReg> + ... + 0) ==
-                              InsnType::kInfo.InputRegistersCount(),
-                          std::array<MachineReg, InsnType::kInfo.OutputRegistersCount()>> {
-    std::array<MachineReg, InsnType::kInfo.InputRegistersCount()> input;
-    int input_index = 0;
-    (
-        [&input, &input_index]<typename Arg>(Arg arg) {
-          if constexpr (std::is_same_v<std::remove_cvref_t<Arg>, MachineReg>) {
-            input[input_index++] = arg;
-          }
-        }(args),
-        ...);
-    std::array<MachineReg, InsnType::kInfo.OutputRegistersCount()> output;
-    input_index = 0;
-    int output_index = 0;
-    std::array<MachineReg, InsnType::kInfo.num_reg_operands> gen_args;
-    for (int index = 0; index < InsnType::kInfo.num_reg_operands; index++) {
-      if (InsnType::kInfo.reg_kinds[index].IsDef()) {
-        if (InsnType::kInfo.reg_kinds[index].RegClass() == &x86_64::kFLAGS) {
-          output[output_index] = GetFlagsRegister();
-        } else {
-          if (!InsnType::kInfo.reg_kinds[index].IsInput()) {
-            output[output_index] = AllocTempReg();
-          } else if (kSSAMode == kSSA) {
-            output[output_index] = AllocTempReg();
-            if (InsnType::kInfo.reg_kinds[index].IsInput()) {
-              builder_.Gen<berberis::Copy>(
-                  output[output_index],
-                  input[input_index++],
-                  x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
-            }
-          } else {
-            output[output_index] = input[input_index++];
-          }
-        }
-        gen_args[index] = output[output_index++];
-      } else {
-        CHECK(InsnType::kInfo.reg_kinds[index].IsInput());
-        if (kSSAMode == kSSA && InsnType::kInfo.reg_kinds[index].RegClass()->num_regs == 1) {
-          CHECK(InsnType::kInfo.reg_kinds[index].RegClass() != &x86_64::kFLAGS);
-          gen_args[index] = AllocTempReg();
-          builder_.Gen<berberis::Copy>(
-              gen_args[index],
-              input[input_index++],
-              x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
-        } else {
-          gen_args[index] = input[input_index++];
-        }
-      }
-    }
-    std::apply(
-        InsnType::template kGenAutoFunc<x86_64::MachineIRBuilder>,
-        std::tuple_cat(
-            std::tuple<x86_64::MachineIRBuilder&>{builder_}, gen_args, []<typename Arg>(Arg arg) {
-              if constexpr (std::is_same_v<std::remove_cvref_t<Arg>, MachineReg>) {
-                return std::tuple{};
-              } else {
-                return std::tuple{arg};
-              }
-            }(args)...));
-    return output;
+  // Syntax sugar mirroring riscv64's Gen<> adapter: hands the instruction to
+  // the MachineIRBuilder, which splits its use_def operands into SSA form.
+  template <typename InsnType>
+  auto Gen(typename InsnType::InputArgsTuple&& args_tuple) {
+    return builder_.GenMachineInsn<InsnType>(std::move(args_tuple), GetFlagsRegister());
   }
 
-  BERBERIS_DECLARE_ARM64_MACHINE_INSN_ADAPTER(
+  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
       /*may_discard*/ auto Gen,
-      (, enum SSAMode kSSAMode = kSSA),
-      MachineInsn,
       InputArgsTuple,
-      BERBERIS_ARM64_INSN_OUTPUT_REGS,
+      typename x86_64::MachineInsn<
+          typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo,
+          x86_64::kForceSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>>::
+          OutputArgsTuple,
       Gen,
-      (, kSSAMode))
+      x86_64::kForceSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
 
-  // Emits an instruction straight through the builder, with none of the SSA
-  // copy insertion Gen() above does: these callers already hold the registers
-  // they pass. Android 16 wrote builder_.Gen<Insn> for this, which AOSP 17 will
-  // not accept for an instruction that has a kUseDef operand unless the SSA
-  // mode is named -- and the adapter names it, as kForceNoSSA, which is the
-  // Android 16 layout.
-  BERBERIS_DECLARE_ARM64_MACHINE_INSN_ADAPTER(
+  // Emits an instruction with none of that splitting: these callers already
+  // hold the registers they pass, and several sequences depend on writing a
+  // register in place. kForceNoSSA names that per instruction, giving the enum
+  // for one that has a use_def operand and the defaulted bool for one that
+  // does not, which is what MachineInsn's static_assert wants of each.
+  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
       /*may_discard*/ auto GenRaw,
-      (),
-      MachineInsn,
       ConstructorArgsTuple,
-      BERBERIS_ARM64_INSN_PTR,
+      x86_64::MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo,
+                          x86_64::kForceNoSSA<typename InsnType<
+                              typename CodeEmitter::Assemblers>::DeviceInsnInfo>>*,
       builder_.Gen,
-      ())
+      x86_64::kForceNoSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
 
   // Materialize ARM64 NZCV into ThreadState.cpu.flags from the host EFLAGS that
   // a preceding x86 ALU op left in `flags_vreg`. Bit-exact with
@@ -721,9 +657,10 @@ class HeavyOptimizerFrontend {
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
     GenRaw<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
-    raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
+    raw = std::get<0>(GenRaw<x86_64::AndlRegImm>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
-      raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
+      raw =
+          std::get<0>(GenRaw<x86_64::XorlRegImm>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
     }
     GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP,
                                .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
@@ -737,8 +674,8 @@ class HeavyOptimizerFrontend {
   // lite_translator.h::ApplyTbi (movq; shlq 8; shrq 8).
   [[nodiscard]] Register ApplyTbi(Register base) {
     Register tbi = Copy(base);
-    tbi = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(tbi, int8_t{8}));
-    tbi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(tbi, int8_t{8}));
+    tbi = std::get<0>(GenRaw<x86_64::ShlqRegImm>(tbi, int8_t{8}));
+    tbi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(tbi, int8_t{8}));
     return tbi;
   }
 

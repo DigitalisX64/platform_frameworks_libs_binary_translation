@@ -298,69 +298,72 @@ Register HeavyOptimizerFrontend::EmitArmCondPredicate(Decoder::Condition cond) {
   // untouched, so mask to the low 16 to get a clean zero-extended value.
   Register flags =
       std::get<0>(Gen<x86_64::MovwRegOp>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}));
-  flags = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(flags, int32_t{0xFFFF}));
+  flags = std::get<0>(GenRaw<x86_64::AndlRegImm>(flags, int32_t{0xFFFF}));
 
   // bit_to_low(pos): (flags >> pos) & 1, as a fresh 0/1 register.
   auto bit_to_low = [&](int8_t pos) -> Register {
     Register r = std::get<0>(Gen<x86_64::MovlRegReg>(flags));
     if (pos != 0) {
-      r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, pos));
+      r = std::get<0>(GenRaw<x86_64::ShrlRegImm>(r, pos));
     }
-    return std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(r, int32_t{1}));
+    return std::get<0>(GenRaw<x86_64::AndlRegImm>(r, int32_t{1}));
   };
 
   switch (cond) {
     case Decoder::Condition::kEq:  // Z==1
       return bit_to_low(kFlagZeroBit);
     case Decoder::Condition::kNe:  // Z==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagZeroBit), int32_t{1}));
     case Decoder::Condition::kCs:  // C==1
       return bit_to_low(kFlagCarryBit);
     case Decoder::Condition::kCc:  // C==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagCarryBit), int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagCarryBit), int32_t{1}));
     case Decoder::Condition::kMi:  // N==1
       return bit_to_low(kFlagNegativeBit);
     case Decoder::Condition::kPl:  // N==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagNegativeBit), int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagNegativeBit), int32_t{1}));
     case Decoder::Condition::kVs:  // V==1
       return bit_to_low(kFlagOverflowBit);
     case Decoder::Condition::kVc:  // V==0
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagOverflowBit), int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagOverflowBit), int32_t{1}));
     case Decoder::Condition::kHi: {  // C==1 && Z==0
       Register c = bit_to_low(kFlagCarryBit);
-      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
-      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(c, not_z));
+      Register not_z =
+          std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagZeroBit), int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::AndlRegReg>(c, not_z));
     }
     case Decoder::Condition::kLs: {  // C==0 || Z==1
-      Register not_c = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagCarryBit), int32_t{1}));
+      Register not_c =
+          std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagCarryBit), int32_t{1}));
       Register z = bit_to_low(kFlagZeroBit);
-      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(not_c, z));
+      return std::get<0>(GenRaw<x86_64::OrlRegReg>(not_c, z));
     }
     case Decoder::Condition::kGe: {  // N==V  -> !(N^V)
       Register n = bit_to_low(kFlagNegativeBit);
       Register v = bit_to_low(kFlagOverflowBit);
-      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
-      return std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
+      Register n_xor_v = std::get<0>(GenRaw<x86_64::XorlRegReg>(n, v));
+      return std::get<0>(GenRaw<x86_64::XorlRegImm>(n_xor_v, int32_t{1}));
     }
     case Decoder::Condition::kLt: {  // N!=V  -> N^V
       Register n = bit_to_low(kFlagNegativeBit);
       Register v = bit_to_low(kFlagOverflowBit);
-      return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
+      return std::get<0>(GenRaw<x86_64::XorlRegReg>(n, v));
     }
     case Decoder::Condition::kGt: {  // Z==0 && N==V
-      Register not_z = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(bit_to_low(kFlagZeroBit), int32_t{1}));
+      Register not_z =
+          std::get<0>(GenRaw<x86_64::XorlRegImm>(bit_to_low(kFlagZeroBit), int32_t{1}));
       Register n = bit_to_low(kFlagNegativeBit);
       Register v = bit_to_low(kFlagOverflowBit);
-      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
-      Register n_eq_v = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(n_xor_v, int32_t{1}));
-      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(not_z, n_eq_v));
+      Register n_xor_v = std::get<0>(GenRaw<x86_64::XorlRegReg>(n, v));
+      Register n_eq_v = std::get<0>(GenRaw<x86_64::XorlRegImm>(n_xor_v, int32_t{1}));
+      return std::get<0>(GenRaw<x86_64::AndlRegReg>(not_z, n_eq_v));
     }
     case Decoder::Condition::kLe: {  // Z==1 || N!=V
       Register z = bit_to_low(kFlagZeroBit);
       Register n = bit_to_low(kFlagNegativeBit);
       Register v = bit_to_low(kFlagOverflowBit);
-      Register n_xor_v = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(n, v));
-      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(z, n_xor_v));
+      Register n_xor_v = std::get<0>(GenRaw<x86_64::XorlRegReg>(n, v));
+      return std::get<0>(GenRaw<x86_64::OrlRegReg>(z, n_xor_v));
     }
     case Decoder::Condition::kAl:
     case Decoder::Condition::kNv:
@@ -394,8 +397,8 @@ void HeavyOptimizerFrontend::EmitCondBranch(Decoder::Condition cond,
   // Bit 15 = N^V, bit 14 = Z.
   auto fold_n_xor_v = [&]() -> Register {
     Register r = std::get<0>(Gen<x86_64::MovlRegReg>(flags));
-    r = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(r, int8_t{kFlagNegativeBit - kFlagOverflowBit}));
-    return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(r, flags));
+    r = std::get<0>(GenRaw<x86_64::ShllRegImm>(r, int8_t{kFlagNegativeBit - kFlagOverflowBit}));
+    return std::get<0>(GenRaw<x86_64::XorlRegReg>(r, flags));
   };
   constexpr int32_t kN = int32_t{1} << kFlagNegativeBit;
   constexpr int32_t kZ = int32_t{1} << kFlagZeroBit;
@@ -427,7 +430,7 @@ void HeavyOptimizerFrontend::EmitCondBranch(Decoder::Condition cond,
       break;
     case Decoder::Condition::kHi:    // C==1 && Z==0
     case Decoder::Condition::kLs: {  // C==0 || Z==1
-      Register cz = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(flags, kC | kZ));
+      Register cz = std::get<0>(GenRaw<x86_64::AndlRegImm>(flags, kC | kZ));
       host_flags = std::get<0>(Gen<x86_64::CmplRegImm>(cz, kC));
       taken = cond == Decoder::Condition::kHi ? HostCond::kEqual : HostCond::kNotEqual;
       break;
@@ -697,9 +700,9 @@ bool HeavyOptimizerFrontend::IsNZCVGapInsn(const MachineInsn* insn) {
 
 void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
   Register raw = tail.raw;
-  raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
+  raw = std::get<0>(GenRaw<x86_64::AndlRegImm>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
   if (tail.is_sub) {
-    raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
+    raw = std::get<0>(GenRaw<x86_64::XorlRegImm>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
   }
   GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP,
                              .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
@@ -743,7 +746,7 @@ void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
     builder_.StartBasicBlock(entry_bb);
     GenRaw<x86_64::MovwRegOp>(fused.tail.raw, {.base = x86_64::kMachineRegRBP, .disp = flags_disp});
     if (fused.tail.is_sub) {
-      Gen<x86_64::XorlRegImm, kNoSSA>(fused.tail.raw, static_cast<int32_t>(CPUState::kFlagCarry));
+      GenRaw<x86_64::XorlRegImm>(fused.tail.raw, static_cast<int32_t>(CPUState::kFlagCarry));
     }
     EmitCondBranch(fused.cond, fused.then_bb, fused.else_bb);
     ir->AddEdge(entry_bb, fused.then_bb);
@@ -865,16 +868,16 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
     case Decoder::ConditionalSelectOpcode::kCsinc:
       false_val = width_adjust(src2);
       if (is_64bit) {
-        false_val = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(false_val, int32_t{1}));
+        false_val = std::get<0>(GenRaw<x86_64::AddqRegImm>(false_val, int32_t{1}));
       } else {
-        false_val = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(false_val, int32_t{1}));
+        false_val = std::get<0>(GenRaw<x86_64::AddlRegImm>(false_val, int32_t{1}));
       }
       break;
     case Decoder::ConditionalSelectOpcode::kCsinv:
       // ~src2. The heavy IR has only a 64-bit NOT; the 32-bit case re-clears the
       // upper half with a 32-bit mov afterwards.
       false_val = Copy(src2);
-      false_val = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(false_val));
+      false_val = std::get<0>(GenRaw<x86_64::NotqReg>(false_val));
       if (!is_64bit) {
         false_val = std::get<0>(Gen<x86_64::MovlRegReg>(false_val));
       }
@@ -884,9 +887,9 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
       // zero-extends the 32-bit result.
       Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
       if (is_64bit) {
-        false_val = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, src2));
+        false_val = std::get<0>(GenRaw<x86_64::SubqRegReg>(zero, src2));
       } else {
-        false_val = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(zero, src2));
+        false_val = std::get<0>(GenRaw<x86_64::SublRegReg>(zero, src2));
       }
       break;
     }
@@ -1010,9 +1013,9 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   Register negbase = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
   Register neg;
   if (is_64bit) {
-    neg = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(negbase, src1));
+    neg = std::get<0>(GenRaw<x86_64::SubqRegReg>(negbase, src1));
   } else {
-    neg = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(negbase, src1));
+    neg = std::get<0>(GenRaw<x86_64::SublRegReg>(negbase, src1));
   }
   builder_.Gen<berberis::Copy>(result, neg, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(neg_one_bb, merge_bb);
@@ -1080,14 +1083,14 @@ void HeavyOptimizerFrontend::ConditionalCompare(bool is_neg,
     if (is_64bit) {
       if (is_neg) {
         Register tmp = Copy(rn);
-        flags = std::get<1>(Gen<x86_64::AddqRegReg, kNoSSA>(tmp, rm));
+        flags = std::get<1>(GenRaw<x86_64::AddqRegReg>(tmp, rm));
       } else {
         flags = std::get<0>(Gen<x86_64::CmpqRegReg>(rn, rm));
       }
     } else {
       if (is_neg) {
         Register tmp = std::get<0>(Gen<x86_64::MovlRegReg>(rn));
-        flags = std::get<1>(Gen<x86_64::AddlRegReg, kNoSSA>(tmp, rm));
+        flags = std::get<1>(GenRaw<x86_64::AddlRegReg>(tmp, rm));
       } else {
         flags = std::get<0>(Gen<x86_64::CmplRegReg>(rn, rm));
       }
@@ -1696,7 +1699,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.StartBasicBlock(pos_bb);
     Register tmp = cvtt_q(xmm);
     builder_.Gen<berberis::Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default in-range
-    Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(tmp), int8_t{32}));
+    Register hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(tmp), int8_t{32}));
     Register hi_flags = std::get<0>(Gen<x86_64::TestqRegReg>(hi, hi));
     ir->AddEdge(pos_bb, done_bb);
     ir->AddEdge(pos_bb, ovf_bb);
@@ -1773,7 +1776,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
       GenRaw<x86_64::SubssXRegXReg>(xsub.machine_reg(), bound63b.machine_reg());
     }
     Register tmp = cvtt_q(xsub);
-    tmp = std::get<0>(Gen<x86_64::BtsqRegImm, kNoSSA>(tmp, int8_t{63}));
+    tmp = std::get<0>(GenRaw<x86_64::BtsqRegImm>(tmp, int8_t{63}));
     builder_.Gen<berberis::Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(inrange_bb, done_bb);
     builder_.Gen<berberis::Branch>(done_bb);
@@ -2119,7 +2122,7 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       // (loop-invariant). For byte/half only the low 8/16 bits of ~Xs matter.
       Register applied = mask;
       if (args.op == Decoder::AtomicOp::kLdclr) {
-        applied = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(Copy(mask)));
+        applied = std::get<0>(GenRaw<x86_64::NotqReg>(Copy(mask)));
       }
 
       auto* ir = builder_.ir();
@@ -2149,13 +2152,13 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       Register new_val = Copy(old);
       switch (args.op) {
         case Decoder::AtomicOp::kLdclr:
-          new_val = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(new_val, applied));
+          new_val = std::get<0>(GenRaw<x86_64::AndqRegReg>(new_val, applied));
           break;
         case Decoder::AtomicOp::kLdset:
-          new_val = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(new_val, applied));
+          new_val = std::get<0>(GenRaw<x86_64::OrqRegReg>(new_val, applied));
           break;
         default:  // kLdeor
-          new_val = std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(new_val, applied));
+          new_val = std::get<0>(GenRaw<x86_64::XorqRegReg>(new_val, applied));
           break;
       }
       // CMPXCHG(expected=old, [mem], new_val). On a miss RAX is reloaded from
@@ -2393,8 +2396,8 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
             : std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
         if (hi != 31) {
           Register h = std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(hi)));
-          h = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(h, int8_t{32}));
-          v = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(v, h));
+          h = std::get<0>(GenRaw<x86_64::ShlqRegImm>(h, int8_t{32}));
+          v = std::get<0>(GenRaw<x86_64::OrqRegReg>(v, h));
         }
         return v;
       };
@@ -2485,8 +2488,8 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
             (args.rt != 31) ? std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(args.rt))) : GetImm(0);
         if (args.rt2 != 31) {
           Register hi = std::get<0>(Gen<x86_64::MovlRegReg>(GetReg(args.rt2)));
-          hi = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(hi, int8_t{32}));
-          new_val = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(new_val, hi));
+          hi = std::get<0>(GenRaw<x86_64::ShlqRegImm>(hi, int8_t{32}));
+          new_val = std::get<0>(GenRaw<x86_64::OrqRegReg>(new_val, hi));
         }
         Register resv_addr = std::get<0>(
             Gen<x86_64::MovqRegOp>({.base = x86_64::kMachineRegRBP, .disp = resv_addr_off}));
@@ -2856,13 +2859,13 @@ Register HeavyOptimizerFrontend::AddSubImm(bool is_sub, bool set_flags, bool is_
     // When setting flags, always emit the op (even imm==0) so EFLAGS are valid.
     if (set_flags || imm != 0) {
       if (is_sub) {
-        auto [r, flags] = Gen<x86_64::SubqRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+        auto [r, flags] = GenRaw<x86_64::SubqRegImm>(res, static_cast<int32_t>(imm));
         res = r;
         if (set_flags) {
           EmitMaterializeNZCV(flags, /*is_sub=*/true);
         }
       } else {
-        auto [r, flags] = Gen<x86_64::AddqRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+        auto [r, flags] = GenRaw<x86_64::AddqRegImm>(res, static_cast<int32_t>(imm));
         res = r;
         if (set_flags) {
           EmitMaterializeNZCV(flags, /*is_sub=*/false);
@@ -2876,13 +2879,13 @@ Register HeavyOptimizerFrontend::AddSubImm(bool is_sub, bool set_flags, bool is_
   Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
   if (set_flags || imm != 0) {
     if (is_sub) {
-      auto [r, flags] = Gen<x86_64::SublRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+      auto [r, flags] = GenRaw<x86_64::SublRegImm>(res, static_cast<int32_t>(imm));
       res = r;
       if (set_flags) {
         EmitMaterializeNZCV(flags, /*is_sub=*/true);
       }
     } else {
-      auto [r, flags] = Gen<x86_64::AddlRegImm, kNoSSA>(res, static_cast<int32_t>(imm));
+      auto [r, flags] = GenRaw<x86_64::AddlRegImm>(res, static_cast<int32_t>(imm));
       res = r;
       if (set_flags) {
         EmitMaterializeNZCV(flags, /*is_sub=*/false);
@@ -2913,17 +2916,17 @@ Register HeavyOptimizerFrontend::LogicalImm(Decoder::LogicalImmOpcode opcode, bo
     Register res = Copy(src);
     switch (opcode) {
       case Decoder::LogicalImmOpcode::kAnd:
-        return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, imm_reg));
+        return std::get<0>(GenRaw<x86_64::AndqRegReg>(res, imm_reg));
       case Decoder::LogicalImmOpcode::kAnds: {
         // ANDS/TST: x86 AND clears CF and OF, so ARM64 C=0 and V=0 naturally.
-        auto [r, flags] = Gen<x86_64::AndqRegReg, kNoSSA>(res, imm_reg);
+        auto [r, flags] = GenRaw<x86_64::AndqRegReg>(res, imm_reg);
         EmitMaterializeNZCV(flags, /*is_sub=*/false);
         return r;
       }
       case Decoder::LogicalImmOpcode::kOrr:
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, imm_reg));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(res, imm_reg));
       case Decoder::LogicalImmOpcode::kEor:
-        return std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(res, imm_reg));
+        return std::get<0>(GenRaw<x86_64::XorqRegReg>(res, imm_reg));
       default:
         UndefinedReturningReg();
         return AllocTempReg();
@@ -2933,16 +2936,16 @@ Register HeavyOptimizerFrontend::LogicalImm(Decoder::LogicalImmOpcode opcode, bo
   Register res = CopyForWrite32(src);
   switch (opcode) {
     case Decoder::LogicalImmOpcode::kAnd:
-      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg));
+      return std::get<0>(GenRaw<x86_64::AndlRegReg>(res, imm_reg));
     case Decoder::LogicalImmOpcode::kAnds: {
-      auto [r, flags] = Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg);
+      auto [r, flags] = GenRaw<x86_64::AndlRegReg>(res, imm_reg);
       EmitMaterializeNZCV(flags, /*is_sub=*/false);
       return r;
     }
     case Decoder::LogicalImmOpcode::kOrr:
-      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, imm_reg));
+      return std::get<0>(GenRaw<x86_64::OrlRegReg>(res, imm_reg));
     case Decoder::LogicalImmOpcode::kEor:
-      return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(res, imm_reg));
+      return std::get<0>(GenRaw<x86_64::XorlRegReg>(res, imm_reg));
     default:
       UndefinedReturningReg();
       return AllocTempReg();
@@ -2974,10 +2977,10 @@ Register HeavyOptimizerFrontend::MoveWideKeep(Register current, uint16_t imm16, 
   Register res = std::get<0>(Gen<x86_64::AndqRegReg>(current, not_mask));
   // res = res | value
   Register value_reg = std::get<0>(Gen<x86_64::MovqRegImm>(static_cast<int64_t>(value)));
-  res = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, value_reg));
+  res = std::get<0>(GenRaw<x86_64::OrqRegReg>(res, value_reg));
   if (!is_64bit) {
     // Zero-extend 32->64 (a 32-bit mov clears the upper 32 bits).
-    res = std::get<0>(Gen<x86_64::MovlRegReg, kNoSSA>(res));
+    res = std::get<0>(GenRaw<x86_64::MovlRegReg>(res));
   }
   return res;
 }
@@ -3028,13 +3031,13 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         Register res = Copy(src);
         if (immr != 0) {
-          res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          res = std::get<0>(GenRaw<x86_64::ShrqRegImm>(res, static_cast<int8_t>(immr)));
         }
         return res;
       }
       Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
       if (immr != 0) {
-        res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        res = std::get<0>(GenRaw<x86_64::ShrlRegImm>(res, static_cast<int8_t>(immr)));
       }
       return res;
     }
@@ -3043,10 +3046,10 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       uint8_t shift = reg_size - immr;
       if (is_64bit) {
         Register res = Copy(src);
-        return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
+        return std::get<0>(GenRaw<x86_64::ShlqRegImm>(res, static_cast<int8_t>(shift)));
       }
       Register res = CopyForWrite32(src);
-      return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
+      return std::get<0>(GenRaw<x86_64::ShllRegImm>(res, static_cast<int8_t>(shift)));
     }
     // UXTB: UBFM Wd, Wn, #0, #7.
     if (!is_64bit && immr == 0 && imms == 7) {
@@ -3064,21 +3067,21 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         Register res = Copy(src);
         if (immr != 0) {
-          res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          res = std::get<0>(GenRaw<x86_64::ShrqRegImm>(res, static_cast<int8_t>(immr)));
         }
         if (width < 64) {
           Register mask_reg = GetImm(mask);
-          res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+          res = std::get<0>(GenRaw<x86_64::AndqRegReg>(res, mask_reg));
         }
         return res;
       }
       Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
       if (immr != 0) {
-        res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        res = std::get<0>(GenRaw<x86_64::ShrlRegImm>(res, static_cast<int8_t>(immr)));
       }
       if (width < 32) {
         res = std::get<0>(
-            Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+            GenRaw<x86_64::AndlRegImm>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
       }
       return res;
     }
@@ -3090,20 +3093,20 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       Register res = Copy(src);
       if (width < 64) {
         Register mask_reg = GetImm(mask);
-        res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+        res = std::get<0>(GenRaw<x86_64::AndqRegReg>(res, mask_reg));
       }
       if (pos != 0) {
-        res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+        res = std::get<0>(GenRaw<x86_64::ShlqRegImm>(res, static_cast<int8_t>(pos)));
       }
       return res;
     }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
     if (width < 32) {
-      res = std::get<0>(
-          Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+      res =
+          std::get<0>(GenRaw<x86_64::AndlRegImm>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
     }
     if (pos != 0) {
-      res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+      res = std::get<0>(GenRaw<x86_64::ShllRegImm>(res, static_cast<int8_t>(pos)));
     }
     return res;
   }
@@ -3114,7 +3117,7 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         Register res = Copy(src);
         if (immr != 0) {
-          res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          res = std::get<0>(GenRaw<x86_64::SarqRegImm>(res, static_cast<int8_t>(immr)));
         }
         return res;
       }
@@ -3122,7 +3125,7 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       // ARM64 W-write semantics. Do NOT sign-extend further.
       Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
       if (immr != 0) {
-        res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+        res = std::get<0>(GenRaw<x86_64::SarlRegImm>(res, static_cast<int8_t>(immr)));
       }
       return res;
     }
@@ -3156,19 +3159,19 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         Register res = Copy(src);
         if (left != 0) {
-          res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(left)));
+          res = std::get<0>(GenRaw<x86_64::ShlqRegImm>(res, static_cast<int8_t>(left)));
         }
         if (right != 0) {
-          res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(right)));
+          res = std::get<0>(GenRaw<x86_64::SarqRegImm>(res, static_cast<int8_t>(right)));
         }
         return res;
       }
       Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
       if (left != 0) {
-        res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(left)));
+        res = std::get<0>(GenRaw<x86_64::ShllRegImm>(res, static_cast<int8_t>(left)));
       }
       if (right != 0) {
-        res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(right)));
+        res = std::get<0>(GenRaw<x86_64::SarlRegImm>(res, static_cast<int8_t>(right)));
       }
       return res;
     }
@@ -3183,19 +3186,19 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
     if (is_64bit) {
       Register res = Copy(src);
       if (sbfiz_left != 0) {
-        res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_left)));
+        res = std::get<0>(GenRaw<x86_64::ShlqRegImm>(res, static_cast<int8_t>(sbfiz_left)));
       }
       if (sbfiz_right != 0) {
-        res = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_right)));
+        res = std::get<0>(GenRaw<x86_64::SarqRegImm>(res, static_cast<int8_t>(sbfiz_right)));
       }
       return res;
     }
     Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
     if (sbfiz_left != 0) {
-      res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_left)));
+      res = std::get<0>(GenRaw<x86_64::ShllRegImm>(res, static_cast<int8_t>(sbfiz_left)));
     }
     if (sbfiz_right != 0) {
-      res = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(res, static_cast<int8_t>(sbfiz_right)));
+      res = std::get<0>(GenRaw<x86_64::SarlRegImm>(res, static_cast<int8_t>(sbfiz_right)));
     }
     return res;
   }
@@ -3212,17 +3215,17 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         res = Copy(src);
         if (immr != 0) {
-          res = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          res = std::get<0>(GenRaw<x86_64::ShrqRegImm>(res, static_cast<int8_t>(immr)));
         }
         Register mask_reg = GetImm(mask);
-        res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, mask_reg));
+        res = std::get<0>(GenRaw<x86_64::AndqRegReg>(res, mask_reg));
       } else {
         res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
         if (immr != 0) {
-          res = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(res, static_cast<int8_t>(immr)));
+          res = std::get<0>(GenRaw<x86_64::ShrlRegImm>(res, static_cast<int8_t>(immr)));
         }
         res = std::get<0>(
-            Gen<x86_64::AndlRegImm, kNoSSA>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
+            GenRaw<x86_64::AndlRegImm>(res, static_cast<int32_t>(mask & 0xFFFFFFFFULL)));
       }
     } else {
       // BFI / BFC: extract low width = imms+1 bits, deposit at pos.
@@ -3233,16 +3236,16 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
       if (is_64bit) {
         res = Copy(src);
         Register fmask_reg = GetImm(field_mask);
-        res = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, fmask_reg));
+        res = std::get<0>(GenRaw<x86_64::AndqRegReg>(res, fmask_reg));
         if (pos != 0) {
-          res = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+          res = std::get<0>(GenRaw<x86_64::ShlqRegImm>(res, static_cast<int8_t>(pos)));
         }
       } else {
         res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-        res = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(
-            res, static_cast<int32_t>(field_mask & 0xFFFFFFFFULL)));
+        res = std::get<0>(
+            GenRaw<x86_64::AndlRegImm>(res, static_cast<int32_t>(field_mask & 0xFFFFFFFFULL)));
         if (pos != 0) {
-          res = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(pos)));
+          res = std::get<0>(GenRaw<x86_64::ShllRegImm>(res, static_cast<int8_t>(pos)));
         }
       }
     }
@@ -3250,13 +3253,13 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
     if (is_64bit) {
       Register keep = Copy(dst_val);
       Register notmask_reg = GetImm(~mask);
-      keep = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(keep, notmask_reg));
-      return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, keep));
+      keep = std::get<0>(GenRaw<x86_64::AndqRegReg>(keep, notmask_reg));
+      return std::get<0>(GenRaw<x86_64::OrqRegReg>(res, keep));
     }
     Register keep = std::get<0>(Gen<x86_64::MovlRegReg>(dst_val));
     keep = std::get<0>(
-        Gen<x86_64::AndlRegImm, kNoSSA>(keep, static_cast<int32_t>((~mask) & 0xFFFFFFFFULL)));
-    return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, keep));
+        GenRaw<x86_64::AndlRegImm>(keep, static_cast<int32_t>((~mask) & 0xFFFFFFFFULL)));
+    return std::get<0>(GenRaw<x86_64::OrlRegReg>(res, keep));
   }
 
   UndefinedReturningReg();
@@ -3361,7 +3364,7 @@ Register HeavyOptimizerFrontend::AddImm(Register base, int32_t offset) {
   }
   Register res = Copy(base);
   if (offset != 0) {
-    res = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(res, offset));
+    res = std::get<0>(GenRaw<x86_64::AddqRegImm>(res, offset));
   }
   return res;
 }
@@ -3542,23 +3545,23 @@ Register HeavyOptimizerFrontend::LogicalShiftedReg(Decoder::LogicalShiftedRegOpc
   if (invert) {
     // NotqReg is 64-bit only; for the 32-bit case the upper half is re-cleared
     // by the subsequent 32-bit op, so a 64-bit NOT is safe.
-    op2 = std::get<0>(Gen<x86_64::NotqReg, kNoSSA>(op2));
+    op2 = std::get<0>(GenRaw<x86_64::NotqReg>(op2));
   }
   if (is_64bit) {
     Register res = Copy(src1);
     switch (opcode) {
       case Decoder::LogicalShiftedRegOpcode::kAnd:
-        return std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(res, op2));
+        return std::get<0>(GenRaw<x86_64::AndqRegReg>(res, op2));
       case Decoder::LogicalShiftedRegOpcode::kAnds: {
         // ANDS/BICS/TST: x86 AND clears CF and OF, so ARM64 C=0 and V=0.
-        auto [r, flags] = Gen<x86_64::AndqRegReg, kNoSSA>(res, op2);
+        auto [r, flags] = GenRaw<x86_64::AndqRegReg>(res, op2);
         EmitMaterializeNZCV(flags, /*is_sub=*/false);
         return r;
       }
       case Decoder::LogicalShiftedRegOpcode::kOrr:
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(res, op2));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(res, op2));
       case Decoder::LogicalShiftedRegOpcode::kEor:
-        return std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(res, op2));
+        return std::get<0>(GenRaw<x86_64::XorqRegReg>(res, op2));
       default:
         UndefinedReturningReg();
         return AllocTempReg();
@@ -3567,16 +3570,16 @@ Register HeavyOptimizerFrontend::LogicalShiftedReg(Decoder::LogicalShiftedRegOpc
   Register res = CopyForWrite32(src1);
   switch (opcode) {
     case Decoder::LogicalShiftedRegOpcode::kAnd:
-      return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, op2));
+      return std::get<0>(GenRaw<x86_64::AndlRegReg>(res, op2));
     case Decoder::LogicalShiftedRegOpcode::kAnds: {
-      auto [r, flags] = Gen<x86_64::AndlRegReg, kNoSSA>(res, op2);
+      auto [r, flags] = GenRaw<x86_64::AndlRegReg>(res, op2);
       EmitMaterializeNZCV(flags, /*is_sub=*/false);
       return r;
     }
     case Decoder::LogicalShiftedRegOpcode::kOrr:
-      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(res, op2));
+      return std::get<0>(GenRaw<x86_64::OrlRegReg>(res, op2));
     case Decoder::LogicalShiftedRegOpcode::kEor:
-      return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(res, op2));
+      return std::get<0>(GenRaw<x86_64::XorlRegReg>(res, op2));
     default:
       UndefinedReturningReg();
       return AllocTempReg();
@@ -3605,13 +3608,13 @@ Register HeavyOptimizerFrontend::AddSubShiftedReg(bool is_sub,
   if (is_64bit) {
     Register res = Copy(src1);
     if (is_sub) {
-      auto [r, flags] = Gen<x86_64::SubqRegReg, kNoSSA>(res, op2);
+      auto [r, flags] = GenRaw<x86_64::SubqRegReg>(res, op2);
       if (set_flags) {
         EmitMaterializeNZCV(flags, /*is_sub=*/true);
       }
       return r;
     }
-    auto [r, flags] = Gen<x86_64::AddqRegReg, kNoSSA>(res, op2);
+    auto [r, flags] = GenRaw<x86_64::AddqRegReg>(res, op2);
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/false);
     }
@@ -3619,13 +3622,13 @@ Register HeavyOptimizerFrontend::AddSubShiftedReg(bool is_sub,
   }
   Register res = CopyForWrite32(src1);
   if (is_sub) {
-    auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, op2);
+    auto [r, flags] = GenRaw<x86_64::SublRegReg>(res, op2);
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/true);
     }
     return r;
   }
-  auto [r, flags] = Gen<x86_64::AddlRegReg, kNoSSA>(res, op2);
+  auto [r, flags] = GenRaw<x86_64::AddlRegReg>(res, op2);
   if (set_flags) {
     EmitMaterializeNZCV(flags, /*is_sub=*/false);
   }
@@ -3697,22 +3700,22 @@ Register HeavyOptimizerFrontend::AddSubExtendedReg(bool is_sub,
   // Apply shift.
   if (shift_amount > 0) {
     if (is_64bit) {
-      ext = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(ext, static_cast<int8_t>(shift_amount)));
+      ext = std::get<0>(GenRaw<x86_64::ShlqRegImm>(ext, static_cast<int8_t>(shift_amount)));
     } else {
-      ext = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(ext, static_cast<int8_t>(shift_amount)));
+      ext = std::get<0>(GenRaw<x86_64::ShllRegImm>(ext, static_cast<int8_t>(shift_amount)));
     }
   }
 
   if (is_64bit) {
     Register res = Copy(src1);
     if (is_sub) {
-      auto [r, flags] = Gen<x86_64::SubqRegReg, kNoSSA>(res, ext);
+      auto [r, flags] = GenRaw<x86_64::SubqRegReg>(res, ext);
       if (set_flags) {
         EmitMaterializeNZCV(flags, /*is_sub=*/true);
       }
       return r;
     }
-    auto [r, flags] = Gen<x86_64::AddqRegReg, kNoSSA>(res, ext);
+    auto [r, flags] = GenRaw<x86_64::AddqRegReg>(res, ext);
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/false);
     }
@@ -3720,13 +3723,13 @@ Register HeavyOptimizerFrontend::AddSubExtendedReg(bool is_sub,
   }
   Register res = CopyForWrite32(src1);
   if (is_sub) {
-    auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, ext);
+    auto [r, flags] = GenRaw<x86_64::SublRegReg>(res, ext);
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/true);
     }
     return r;
   }
-  auto [r, flags] = Gen<x86_64::AddlRegReg, kNoSSA>(res, ext);
+  auto [r, flags] = GenRaw<x86_64::AddlRegReg>(res, ext);
   if (set_flags) {
     EmitMaterializeNZCV(flags, /*is_sub=*/false);
   }
@@ -3790,13 +3793,13 @@ Register HeavyOptimizerFrontend::DataProc2Src(Decoder::DataProc2SrcOpcode opcode
       Register acc = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
       switch (opcode) {
         case Decoder::DataProc2SrcOpcode::kCrc32cb:
-          return std::get<0>(Gen<x86_64::Crc32cbRegReg, kNoSSA>(acc, src2));
+          return std::get<0>(GenRaw<x86_64::Crc32cbRegReg>(acc, src2));
         case Decoder::DataProc2SrcOpcode::kCrc32ch:
-          return std::get<0>(Gen<x86_64::Crc32chRegReg, kNoSSA>(acc, src2));
+          return std::get<0>(GenRaw<x86_64::Crc32chRegReg>(acc, src2));
         case Decoder::DataProc2SrcOpcode::kCrc32cw:
-          return std::get<0>(Gen<x86_64::Crc32cwRegReg, kNoSSA>(acc, src2));
+          return std::get<0>(GenRaw<x86_64::Crc32cwRegReg>(acc, src2));
         default:
-          return std::get<0>(Gen<x86_64::Crc32cxRegReg, kNoSSA>(acc, src2));
+          return std::get<0>(GenRaw<x86_64::Crc32cxRegReg>(acc, src2));
       }
     }
     // IEEE CRC32B/H/W/X — poly 0x04C11DB7 (reflected 0xEDB88320). The host SSE4.2
@@ -3891,44 +3894,44 @@ Register HeavyOptimizerFrontend::DataProc3Src(Decoder::DataProc3SrcOpcode opcode
     case Decoder::DataProc3SrcOpcode::kMadd: {
       if (is_64bit) {
         Register prod = std::get<0>(Gen<x86_64::ImulqRegReg>(src1, src2));
-        return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(prod, src3));
+        return std::get<0>(GenRaw<x86_64::AddqRegReg>(prod, src3));
       }
       Register prod = std::get<0>(Gen<x86_64::ImullRegReg>(src1, src2));
-      return std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(prod, src3));
+      return std::get<0>(GenRaw<x86_64::AddlRegReg>(prod, src3));
     }
     case Decoder::DataProc3SrcOpcode::kMsub: {
       if (is_64bit) {
         Register prod = std::get<0>(Gen<x86_64::ImulqRegReg>(src1, src2));
         Register res = Copy(src3);
-        return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+        return std::get<0>(GenRaw<x86_64::SubqRegReg>(res, prod));
       }
       Register prod = std::get<0>(Gen<x86_64::ImullRegReg>(src1, src2));
       Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src3));
-      return std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(res, prod));
+      return std::get<0>(GenRaw<x86_64::SublRegReg>(res, prod));
     }
     case Decoder::DataProc3SrcOpcode::kSmaddl:
     case Decoder::DataProc3SrcOpcode::kSmsubl: {
       // Sign-extend both 32-bit sources to 64-bit, then 64-bit multiply.
       Register ext1 = std::get<0>(Gen<x86_64::MovsxlqRegReg>(src1));
       Register ext2 = std::get<0>(Gen<x86_64::MovsxlqRegReg>(src2));
-      Register prod = std::get<0>(Gen<x86_64::ImulqRegReg, kNoSSA>(ext1, ext2));
+      Register prod = std::get<0>(GenRaw<x86_64::ImulqRegReg>(ext1, ext2));
       Register res = Copy(src3);
       if (opcode == Decoder::DataProc3SrcOpcode::kSmaddl) {
-        return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, prod));
+        return std::get<0>(GenRaw<x86_64::AddqRegReg>(res, prod));
       }
-      return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+      return std::get<0>(GenRaw<x86_64::SubqRegReg>(res, prod));
     }
     case Decoder::DataProc3SrcOpcode::kUmaddl:
     case Decoder::DataProc3SrcOpcode::kUmsubl: {
       // Zero-extend both 32-bit sources to 64-bit (Movl), then 64-bit multiply.
       Register ext1 = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
       Register ext2 = std::get<0>(Gen<x86_64::MovlRegReg>(src2));
-      Register prod = std::get<0>(Gen<x86_64::ImulqRegReg, kNoSSA>(ext1, ext2));
+      Register prod = std::get<0>(GenRaw<x86_64::ImulqRegReg>(ext1, ext2));
       Register res = Copy(src3);
       if (opcode == Decoder::DataProc3SrcOpcode::kUmaddl) {
-        return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(res, prod));
+        return std::get<0>(GenRaw<x86_64::AddqRegReg>(res, prod));
       }
-      return std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(res, prod));
+      return std::get<0>(GenRaw<x86_64::SubqRegReg>(res, prod));
     }
     case Decoder::DataProc3SrcOpcode::kUmulh:
       // UMULH: Xd = high 64 bits of (Xn * Xm), unsigned. MulqRegRegReg returns
@@ -3973,26 +3976,26 @@ Register HeavyOptimizerFrontend::AddSubWithCarry(Register src1, Register src2, b
   }
   if (is_64bit) {
     if (is_sub) {
-      auto [r, flags] = Gen<x86_64::SbbqRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+      auto [r, flags] = GenRaw<x86_64::SbbqRegReg>(res, src2, GetFlagsRegister());
       if (set_flags) {
         EmitMaterializeNZCV(flags, /*is_sub=*/true);
       }
       return r;
     }
-    auto [r, flags] = Gen<x86_64::AdcqRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+    auto [r, flags] = GenRaw<x86_64::AdcqRegReg>(res, src2, GetFlagsRegister());
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/false);
     }
     return r;
   }
   if (is_sub) {
-    auto [r, flags] = Gen<x86_64::SbblRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+    auto [r, flags] = GenRaw<x86_64::SbblRegReg>(res, src2, GetFlagsRegister());
     if (set_flags) {
       EmitMaterializeNZCV(flags, /*is_sub=*/true);
     }
     return r;
   }
-  auto [r, flags] = Gen<x86_64::AdclRegReg, kNoSSA>(res, src2, GetFlagsRegister());
+  auto [r, flags] = GenRaw<x86_64::AdclRegReg>(res, src2, GetFlagsRegister());
   if (set_flags) {
     EmitMaterializeNZCV(flags, /*is_sub=*/false);
   }
@@ -4023,21 +4026,21 @@ Register HeavyOptimizerFrontend::DataProc1Src(Register src, uint8_t opcode2, boo
       if (is_64bit) {
         Register lo = Copy(src);
         Register lo_mask = GetImm(0x00FF00FF00FF00FFULL);
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, lo_mask));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(lo, lo_mask));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{8}));
         Register hi = Copy(src);
         Register hi_mask = GetImm(0xFF00FF00FF00FF00ULL);
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, hi_mask));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, hi_mask));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{8}));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
       }
       Register lo = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-      lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(lo, 0x00FF00FF));
-      lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
+      lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(lo, 0x00FF00FF));
+      lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{8}));
       Register hi = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-      hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, static_cast<int32_t>(0xFF00FF00)));
-      hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{8}));
-      return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+      hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, static_cast<int32_t>(0xFF00FF00)));
+      hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(hi, int8_t{8}));
+      return std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
     }
     case 0b000010:  // REV32 (sf=1) / REV (sf=0): byte-reverse each 32-bit word.
       // No x86 BSWAP MachineIR op, so byte-swap with the SWAR shift/mask/or
@@ -4050,37 +4053,37 @@ Register HeavyOptimizerFrontend::DataProc1Src(Register src, uint8_t opcode2, boo
         // Swap bytes within each 16-bit halfword.
         Register lo = Copy(x);
         Register m1 = GetImm(0x00FF00FF00FF00FFULL);
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m1));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(lo, m1));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{8}));
         Register hi = Copy(x);
         Register m2 = GetImm(0xFF00FF00FF00FF00ULL);
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m2));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, m2));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{8}));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Swap 16-bit halves within each 32-bit word.
         lo = Copy(x);
         Register m3 = GetImm(0x0000FFFF0000FFFFULL);
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m3));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(lo, m3));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{16}));
         hi = Copy(x);
         Register m4 = GetImm(0xFFFF0000FFFF0000ULL);
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m4));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{16}));
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, m4));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{16}));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
       } else {
         // REV Wd: byte-reverse the 32-bit word (zero-extends to 64).
         Register lo = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-        lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(lo, 0x00FF00FF));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
+        lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(lo, 0x00FF00FF));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{8}));
         Register hi = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, static_cast<int32_t>(0xFF00FF00)));
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{8}));
-        Register x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, static_cast<int32_t>(0xFF00FF00)));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(hi, int8_t{8}));
+        Register x = std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
         lo = Copy(x);
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{16}));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{16}));
         hi = Copy(x);
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(hi, int8_t{16}));
-        return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(hi, int8_t{16}));
+        return std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
       }
     case 0b000011:  // REV (64-bit full byte reverse).
       // SWAR byte-swap: halfword swap, then halfword-pair swap within words,
@@ -4090,29 +4093,29 @@ Register HeavyOptimizerFrontend::DataProc1Src(Register src, uint8_t opcode2, boo
         // Swap bytes within each 16-bit halfword.
         Register lo = Copy(x);
         Register m1 = GetImm(0x00FF00FF00FF00FFULL);
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m1));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(lo, m1));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{8}));
         Register hi = Copy(x);
         Register m2 = GetImm(0xFF00FF00FF00FF00ULL);
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m2));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{8}));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, m2));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{8}));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Swap 16-bit halves within each 32-bit word.
         lo = Copy(x);
         Register m3 = GetImm(0x0000FFFF0000FFFFULL);
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(lo, m3));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(lo, m3));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{16}));
         hi = Copy(x);
         Register m4 = GetImm(0xFFFF0000FFFF0000ULL);
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, m4));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{16}));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, m4));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{16}));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Swap the two 32-bit words.
         lo = Copy(x);
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{32}));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{32}));
         hi = Copy(x);
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(hi, int8_t{32}));
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(hi, int8_t{32}));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
       }
       // REV is X-form only for opcode2=000011; sf=0 is not encoded. Bail safely.
       UndefinedReturningReg();
@@ -4138,21 +4141,21 @@ Register HeavyOptimizerFrontend::DataProc1Src(Register src, uint8_t opcode2, boo
       }
       if (is_64bit) {
         Register sar = Copy(src);
-        sar = std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(sar, int8_t{1}));
+        sar = std::get<0>(GenRaw<x86_64::SarqRegImm>(sar, int8_t{1}));
         Register xored = Copy(src);
-        xored = std::get<0>(Gen<x86_64::XorqRegReg, kNoSSA>(xored, sar));
+        xored = std::get<0>(GenRaw<x86_64::XorqRegReg>(xored, sar));
         Register lz = std::get<0>(Gen<x86_64::LzcntqRegReg>(xored));
-        return std::get<0>(Gen<x86_64::SubqRegImm, kNoSSA>(lz, int32_t{1}));
+        return std::get<0>(GenRaw<x86_64::SubqRegImm>(lz, int32_t{1}));
       } else {
         // 32-bit: Movl src into a clean 32-bit value first, Sarl/Lzcntl operate
         // over 32 bits and zero-extend the result to 64 (ARM64 W-write).
         Register clean = std::get<0>(Gen<x86_64::MovlRegReg>(src));
         Register sar = Copy(clean);
-        sar = std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(sar, int8_t{1}));
+        sar = std::get<0>(GenRaw<x86_64::SarlRegImm>(sar, int8_t{1}));
         Register xored = Copy(clean);
-        xored = std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(xored, sar));
+        xored = std::get<0>(GenRaw<x86_64::XorlRegReg>(xored, sar));
         Register lz = std::get<0>(Gen<x86_64::LzcntlRegReg>(xored));
-        return std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(lz, int32_t{1}));
+        return std::get<0>(GenRaw<x86_64::SublRegImm>(lz, int32_t{1}));
       }
     case 0b000000:  // RBIT: reverse bit order.
       // SWAR bit-reverse: swap adjacent bits, then bit-pairs, then nibbles
@@ -4161,64 +4164,65 @@ Register HeavyOptimizerFrontend::DataProc1Src(Register src, uint8_t opcode2, boo
       if (is_64bit) {
         Register x = Copy(src);
         // Swap adjacent bits (mask 0x5555..., shift 1).
-        Register lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x5555555555555555ULL)));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{1}));
-        Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{1}));
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x5555555555555555ULL)));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        Register lo =
+            std::get<0>(GenRaw<x86_64::AndqRegReg>(Copy(x), GetImm(0x5555555555555555ULL)));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{1}));
+        Register hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{1}));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, GetImm(0x5555555555555555ULL)));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Swap bit-pairs (mask 0x3333..., shift 2).
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x3333333333333333ULL)));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{2}));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{2}));
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x3333333333333333ULL)));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(Copy(x), GetImm(0x3333333333333333ULL)));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{2}));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{2}));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, GetImm(0x3333333333333333ULL)));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Swap nibbles (mask 0x0F0F..., shift 4).
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x0F0F0F0F0F0F0F0FULL)));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{4}));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{4}));
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x0F0F0F0F0F0F0F0FULL)));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(Copy(x), GetImm(0x0F0F0F0F0F0F0F0FULL)));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{4}));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{4}));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, GetImm(0x0F0F0F0F0F0F0F0FULL)));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
         // Reverse byte order: halfword-byte swap, halfword-pair swap, word swap.
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x00FF00FF00FF00FFULL)));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{8}));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{8}));
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x00FF00FF00FF00FFULL)));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
-        lo = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(Copy(x), GetImm(0x0000FFFF0000FFFFULL)));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(lo, int8_t{16}));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{16}));
-        hi = std::get<0>(Gen<x86_64::AndqRegReg, kNoSSA>(hi, GetImm(0x0000FFFF0000FFFFULL)));
-        x = std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
-        lo = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(Copy(x), int8_t{32}));
-        hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(x), int8_t{32}));
-        return std::get<0>(Gen<x86_64::OrqRegReg, kNoSSA>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(Copy(x), GetImm(0x00FF00FF00FF00FFULL)));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{8}));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{8}));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, GetImm(0x00FF00FF00FF00FFULL)));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndqRegReg>(Copy(x), GetImm(0x0000FFFF0000FFFFULL)));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(lo, int8_t{16}));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{16}));
+        hi = std::get<0>(GenRaw<x86_64::AndqRegReg>(hi, GetImm(0x0000FFFF0000FFFFULL)));
+        x = std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::ShlqRegImm>(Copy(x), int8_t{32}));
+        hi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(Copy(x), int8_t{32}));
+        return std::get<0>(GenRaw<x86_64::OrqRegReg>(lo, hi));
       } else {
         // RBIT Wd: reverse the low 32 bits, zero-extend.
         Register x = std::get<0>(Gen<x86_64::MovlRegReg>(src));
-        Register lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x55555555));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{1}));
-        Register hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{1}));
-        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x55555555));
-        x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
-        lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x33333333));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{2}));
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{2}));
-        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x33333333));
-        x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
-        lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x0F0F0F0F));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{4}));
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{4}));
-        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x0F0F0F0F));
-        x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        Register lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(x), 0x55555555));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{1}));
+        Register hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(x), int8_t{1}));
+        hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, 0x55555555));
+        x = std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(x), 0x33333333));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{2}));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(x), int8_t{2}));
+        hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, 0x33333333));
+        x = std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(x), 0x0F0F0F0F));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{4}));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(x), int8_t{4}));
+        hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, 0x0F0F0F0F));
+        x = std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
         // Byte-reverse the 32-bit word: halfword-byte swap then halfword swap.
-        lo = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(x), 0x00FF00FF));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(lo, int8_t{8}));
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{8}));
-        hi = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(hi, 0x00FF00FF));
-        x = std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
-        lo = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(Copy(x), int8_t{16}));
-        hi = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(x), int8_t{16}));
-        return std::get<0>(Gen<x86_64::OrlRegReg, kNoSSA>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(x), 0x00FF00FF));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(lo, int8_t{8}));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(x), int8_t{8}));
+        hi = std::get<0>(GenRaw<x86_64::AndlRegImm>(hi, 0x00FF00FF));
+        x = std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
+        lo = std::get<0>(GenRaw<x86_64::ShllRegImm>(Copy(x), int8_t{16}));
+        hi = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(x), int8_t{16}));
+        return std::get<0>(GenRaw<x86_64::OrlRegReg>(lo, hi));
       }
     default:
       // Any remaining unhandled DP-1Src opcode: fall back to the interpreter.
@@ -4244,10 +4248,10 @@ Register HeavyOptimizerFrontend::Extr(Register src_n, Register src_m, uint8_t ls
   // ARM EXTR Rd = (Rn:Rm) >> lsb = SHRD(Rm, Rn, lsb): dest=Rm, src=Rn.
   if (is_64bit) {
     Register res = Copy(src_m);
-    return std::get<0>(Gen<x86_64::ShrdqRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
+    return std::get<0>(GenRaw<x86_64::ShrdqRegRegImm>(res, src_n, static_cast<int8_t>(lsb)));
   }
   Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src_m));
-  return std::get<0>(Gen<x86_64::ShrdlRegRegImm, kNoSSA>(res, src_n, static_cast<int8_t>(lsb)));
+  return std::get<0>(GenRaw<x86_64::ShrdlRegRegImm>(res, src_n, static_cast<int8_t>(lsb)));
 }
 
 void HeavyOptimizerFrontend::MteDataProc(const Decoder::MteDataProcArgs& args) {
@@ -4304,7 +4308,7 @@ void HeavyOptimizerFrontend::FpCondSelect(uint8_t rd, uint8_t rn, uint8_t rm, ui
   Register pred = EmitArmCondPredicate(cond);  // 0/1
   // mask_gp = 0 - pred (no Neg op in the heavy IR; mirrors CSNEG's negate).
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-  Register mask_gp = std::get<0>(Gen<x86_64::SubqRegReg, kNoSSA>(zero, pred));
+  Register mask_gp = std::get<0>(GenRaw<x86_64::SubqRegReg>(zero, pred));
   FpRegister mask = AllocTempSimdReg();
   GenRaw<x86_64::MovqXRegReg>(mask.machine_reg(), mask_gp);
 
@@ -4784,9 +4788,8 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     MachineBasicBlock* done_bb = ir->NewBasicBlock();
 
     // exp == 0xFF ? Compute (bits & 0x7F800000) ^ 0x7F800000; ZF set iff all-ones.
-    Register exp = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(bits),
-                                                              int32_t{0x7F800000}));
-    exp = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(exp, int32_t{0x7F800000}));
+    Register exp = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(bits), int32_t{0x7F800000}));
+    exp = std::get<0>(GenRaw<x86_64::XorlRegImm>(exp, int32_t{0x7F800000}));
     Register exp_flags = std::get<0>(Gen<x86_64::TestlRegReg>(exp, exp));
     auto* cur_bb = builder_.bb();
     ir->AddEdge(cur_bb, checkmant_bb);
@@ -4795,8 +4798,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
 
     // exp all-ones: mantissa != 0 -> NaN, else (±Inf) -> RTNE.
     builder_.StartBasicBlock(checkmant_bb);
-    Register mant = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(Copy(bits),
-                                                               int32_t{0x007FFFFF}));
+    Register mant = std::get<0>(GenRaw<x86_64::AndlRegImm>(Copy(bits), int32_t{0x007FFFFF}));
     Register mant_flags = std::get<0>(Gen<x86_64::TestlRegReg>(mant, mant));
     ir->AddEdge(checkmant_bb, nan_bb);
     ir->AddEdge(checkmant_bb, rtne_bb);
@@ -4804,19 +4806,19 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
 
     // RTNE: out = (bits + 0x7FFF + ((bits>>16)&1)) >> 16.
     builder_.StartBasicBlock(rtne_bb);
-    Register lsb = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(bits), int8_t{16}));
-    lsb = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(lsb, int32_t{1}));
-    Register r = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(Copy(bits), int32_t{0x7FFF}));
-    r = std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(r, lsb));
-    r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, int8_t{16}));
+    Register lsb = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(bits), int8_t{16}));
+    lsb = std::get<0>(GenRaw<x86_64::AndlRegImm>(lsb, int32_t{1}));
+    Register r = std::get<0>(GenRaw<x86_64::AddlRegImm>(Copy(bits), int32_t{0x7FFF}));
+    r = std::get<0>(GenRaw<x86_64::AddlRegReg>(r, lsb));
+    r = std::get<0>(GenRaw<x86_64::ShrlRegImm>(r, int8_t{16}));
     builder_.Gen<berberis::Copy>(out, r, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(rtne_bb, done_bb);
     builder_.Gen<berberis::Branch>(done_bb);
 
     // NaN: out = (bits >> 16) | 0x0040 (force BF16 mantissa MSB -> quiet).
     builder_.StartBasicBlock(nan_bb);
-    Register n = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(bits), int8_t{16}));
-    n = std::get<0>(Gen<x86_64::OrlRegImm, kNoSSA>(n, int32_t{0x0040}));
+    Register n = std::get<0>(GenRaw<x86_64::ShrlRegImm>(Copy(bits), int8_t{16}));
+    n = std::get<0>(GenRaw<x86_64::OrlRegImm>(n, int32_t{0x0040}));
     builder_.Gen<berberis::Copy>(out, n, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
     builder_.Gen<berberis::Branch>(done_bb);
@@ -9676,11 +9678,11 @@ void HeavyOptimizerFrontend::AdvSimdSingleStruct(const Decoder::AdvSimdSingleStr
     Register new_base = Copy(reread_base);
     if (args.rm == 31) {
       // Immediate post-index: total bytes accessed = num_regs * esize.
-      new_base = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(
-          new_base, static_cast<int32_t>(args.num_regs) * esize));
+      new_base = std::get<0>(
+          GenRaw<x86_64::AddqRegImm>(new_base, static_cast<int32_t>(args.num_regs) * esize));
     } else {
       Register rm_val = GetReg(args.rm);
-      new_base = std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(new_base, rm_val));
+      new_base = std::get<0>(GenRaw<x86_64::AddqRegReg>(new_base, rm_val));
     }
     if (args.rn == 31) {
       SetSp(new_base);
@@ -10663,7 +10665,7 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
         }
         Register cnt = std::get<0>(Gen<x86_64::LzcntlRegReg>(lane));
         if (correction != 0) {
-          cnt = std::get<0>(Gen<x86_64::SublRegImm, kNoSSA>(cnt, correction));
+          cnt = std::get<0>(GenRaw<x86_64::SublRegImm>(cnt, correction));
         }
         switch (args.size) {
           case 0b00:
@@ -15921,11 +15923,11 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
       Register reread_base = (rn == 31) ? GetSp() : GetReg(rn);
       Register new_base = Copy(reread_base);
       if (rm == 31) {
-        new_base = std::get<0>(Gen<x86_64::AddqRegImm, kNoSSA>(
-            new_base, static_cast<int32_t>(num_regs) * vec_bytes));
+        new_base = std::get<0>(
+            GenRaw<x86_64::AddqRegImm>(new_base, static_cast<int32_t>(num_regs) * vec_bytes));
       } else {
         Register rm_val = GetReg(rm);
-        new_base = std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(new_base, rm_val));
+        new_base = std::get<0>(GenRaw<x86_64::AddqRegReg>(new_base, rm_val));
       }
       if (rn == 31) {
         SetSp(new_base);
@@ -15978,10 +15980,10 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
     if (rm == 31) {
       // Immediate post-index: total bytes accessed = num_regs * vec_bytes.
       new_base = std::get<0>(
-          Gen<x86_64::AddqRegImm, kNoSSA>(new_base, static_cast<int32_t>(num_regs) * vec_bytes));
+          GenRaw<x86_64::AddqRegImm>(new_base, static_cast<int32_t>(num_regs) * vec_bytes));
     } else {
       Register rm_val = GetReg(rm);
-      new_base = std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(new_base, rm_val));
+      new_base = std::get<0>(GenRaw<x86_64::AddqRegReg>(new_base, rm_val));
     }
     if (rn == 31) {
       SetSp(new_base);
@@ -16351,9 +16353,9 @@ Register HeavyOptimizerFrontend::EmitRegOffsetAddr(Register base,
     return EmitLeaBaseIndex(base, addr, shift_amount);
   }
   if (shift_amount != 0) {
-    addr = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(addr, static_cast<int8_t>(shift_amount)));
+    addr = std::get<0>(GenRaw<x86_64::ShlqRegImm>(addr, static_cast<int8_t>(shift_amount)));
   }
-  return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(addr, base));
+  return std::get<0>(GenRaw<x86_64::AddqRegReg>(addr, base));
 }
 
 Register HeavyOptimizerFrontend::EmitLeaBaseIndex(Register base,
@@ -16382,13 +16384,13 @@ Register HeavyOptimizerFrontend::EmitShiftImm(Register src,
     int8_t amt = static_cast<int8_t>(shift_amount);
     switch (shift_type) {
       case Decoder::ShiftType::kLsl:
-        return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(dst, amt));
+        return std::get<0>(GenRaw<x86_64::ShlqRegImm>(dst, amt));
       case Decoder::ShiftType::kLsr:
-        return std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(dst, amt));
+        return std::get<0>(GenRaw<x86_64::ShrqRegImm>(dst, amt));
       case Decoder::ShiftType::kAsr:
-        return std::get<0>(Gen<x86_64::SarqRegImm, kNoSSA>(dst, amt));
+        return std::get<0>(GenRaw<x86_64::SarqRegImm>(dst, amt));
       case Decoder::ShiftType::kRor:
-        return std::get<0>(Gen<x86_64::RorqRegImm, kNoSSA>(dst, amt));
+        return std::get<0>(GenRaw<x86_64::RorqRegImm>(dst, amt));
     }
     return dst;
   }
@@ -16399,13 +16401,13 @@ Register HeavyOptimizerFrontend::EmitShiftImm(Register src,
   int8_t amt = static_cast<int8_t>(shift_amount);
   switch (shift_type) {
     case Decoder::ShiftType::kLsl:
-      return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(dst, amt));
+      return std::get<0>(GenRaw<x86_64::ShllRegImm>(dst, amt));
     case Decoder::ShiftType::kLsr:
-      return std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(dst, amt));
+      return std::get<0>(GenRaw<x86_64::ShrlRegImm>(dst, amt));
     case Decoder::ShiftType::kAsr:
-      return std::get<0>(Gen<x86_64::SarlRegImm, kNoSSA>(dst, amt));
+      return std::get<0>(GenRaw<x86_64::SarlRegImm>(dst, amt));
     case Decoder::ShiftType::kRor:
-      return std::get<0>(Gen<x86_64::RorlRegImm, kNoSSA>(dst, amt));
+      return std::get<0>(GenRaw<x86_64::RorlRegImm>(dst, amt));
   }
   return dst;
 }
