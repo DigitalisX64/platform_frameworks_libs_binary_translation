@@ -630,6 +630,21 @@ class HeavyOptimizerFrontend {
       Gen,
       x86_64::kForceSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
 
+  // No splitting either, but the flags register is filled in for the caller,
+  // the way the pre-rework Gen() did: these callers pass only the instruction's
+  // input operands. Same forwarder as Gen() above -- the mode travels in
+  // InsnType, so GenMachineInsn sees kNoSSA and leaves a use_def operand in one
+  // register.
+  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
+      /*may_discard*/ auto GenInPlace,
+      InputArgsTuple,
+      typename x86_64::MachineInsn<
+          typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo,
+          x86_64::kForceNoSSA<typename InsnType<
+              typename CodeEmitter::Assemblers>::DeviceInsnInfo>>::OutputArgsTuple,
+      Gen,
+      x86_64::kForceNoSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
+
   // Emits an instruction with none of that splitting: these callers already
   // hold the registers they pass, and several sequences depend on writing a
   // register in place. kForceNoSSA names that per instruction, giving the enum
@@ -657,10 +672,10 @@ class HeavyOptimizerFrontend {
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
     GenRaw<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
-    raw = std::get<0>(GenRaw<x86_64::AndlRegImm>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
+    raw = std::get<0>(GenInPlace<x86_64::AndlRegImm>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
-      raw =
-          std::get<0>(GenRaw<x86_64::XorlRegImm>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
+      raw = std::get<0>(
+          GenInPlace<x86_64::XorlRegImm>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
     }
     GenRaw<x86_64::MovwOpReg>({.base = x86_64::kMachineRegRBP,
                                .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
@@ -674,8 +689,8 @@ class HeavyOptimizerFrontend {
   // lite_translator.h::ApplyTbi (movq; shlq 8; shrq 8).
   [[nodiscard]] Register ApplyTbi(Register base) {
     Register tbi = Copy(base);
-    tbi = std::get<0>(GenRaw<x86_64::ShlqRegImm>(tbi, int8_t{8}));
-    tbi = std::get<0>(GenRaw<x86_64::ShrqRegImm>(tbi, int8_t{8}));
+    tbi = std::get<0>(GenInPlace<x86_64::ShlqRegImm>(tbi, int8_t{8}));
+    tbi = std::get<0>(GenInPlace<x86_64::ShrqRegImm>(tbi, int8_t{8}));
     return tbi;
   }
 
