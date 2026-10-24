@@ -1144,7 +1144,7 @@ void HeavyOptimizerFrontend::EmitStoreArmFpNZCV(Register flags_vreg) {
   const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
 
   Register raw = AllocTempReg();
-  builder_.Gen<ReadFlagsWithOverflow>(raw, flags_vreg);
+  builder_.Gen<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
 
   auto* ir = builder_.ir();
   MachineBasicBlock* uo_bb = ir->NewBasicBlock();       // unordered (PF)

@@ -689,8 +689,7 @@ class HeavyOptimizerFrontend {
       (, enum SSAMode kSSAMode = kSSA),
       MachineInsn,
       InputArgsTuple,
-      typename x86_64::MachineInsn<
-          typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>::OutputArgsTuple,
+      BERBERIS_ARM64_INSN_OUTPUT_TUPLE,
       Gen,
       (, kSSAMode))
 
@@ -706,7 +705,7 @@ class HeavyOptimizerFrontend {
   // touches a neighbouring field.
   void EmitMaterializeNZCV(Register flags_vreg, bool is_sub) {
     Register raw = AllocTempReg();
-    builder_.Gen<ReadFlagsWithOverflow>(raw, flags_vreg);
+    builder_.Gen<x86_64::ReadFlagsWithOverflow>(raw, flags_vreg);
     raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
     if (is_sub) {
       raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
