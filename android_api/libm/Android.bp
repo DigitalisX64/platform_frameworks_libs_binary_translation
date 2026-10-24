@@ -22,7 +22,7 @@ package {
 // cc_library_shared {
 //     name: "libberberis_proxy_libm",
 //     defaults: [
-//         "berberis_defaults_64",
+//         "berberis_riscv64_defaults",
 //         "native_bridge_proxy_libm_defaults",
 //     ],
 //     header_libs: [

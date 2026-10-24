@@ -85,7 +85,10 @@ cc_library_static {
 // region digitalis
 cc_library_headers {
     name: "libberberis_interpreter_arm64_headers",
-    defaults: ["berberis_all_hosts_defaults"],
+    defaults: [
+        "berberis_guest_agnostic_defaults",
+        "berberis_enable_arm64_host_defaults",
+    ],
     host_supported: true,
     export_include_dirs: ["include"],
 }
@@ -93,7 +96,8 @@ cc_library_headers {
 cc_library_static {
     name: "libberberis_interpreter_arm64",
     defaults: [
-        "berberis_all_hosts_defaults_64",
+        "berberis_guest_agnostic_defaults_64",
+        "berberis_enable_arm64_host_defaults",
     ],
     host_supported: true,
     header_libs: [

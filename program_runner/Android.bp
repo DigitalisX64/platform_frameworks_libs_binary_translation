@@ -98,7 +98,7 @@ cc_binary {
 // libberberis_riscv64.
 cc_defaults {
     name: "berberis_program_runner_defaults_arm64_to_x86_64",
-    defaults: ["berberis_defaults_64"],
+    defaults: ["berberis_guest_agnostic_defaults_64"],
     host_supported: true,
     static_libs: [
         "libberberis_base",

@@ -19,7 +19,7 @@ package {
 
 cc_library_headers {
     name: "libberberis_heavy_optimizer_arm64_headers",
-    defaults: ["berberis_defaults_64"],
+    defaults: ["berberis_guest_agnostic_defaults_64"],
     host_supported: true,
     export_include_dirs: ["include"],
     header_libs: [
@@ -48,7 +48,7 @@ cc_library_headers {
 // riscv64 macro-assembler header set.
 cc_library_static {
     name: "libberberis_heavy_optimizer_arm64",
-    defaults: ["berberis_defaults_64"],
+    defaults: ["berberis_guest_agnostic_defaults_64"],
     host_supported: true,
     local_include_dirs: ["."],
     header_libs: [

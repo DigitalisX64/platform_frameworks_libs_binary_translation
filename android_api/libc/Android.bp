@@ -22,7 +22,7 @@ package {
 // cc_library_shared {
 //     name: "libberberis_proxy_libc",
 //     defaults: [
-//         "berberis_defaults_64",
+//         "berberis_riscv64_defaults",
 //         "//frameworks/libs/native_bridge_support/android_api/libc:native_bridge_proxy_libc_defaults",
 //     ],
 //     header_libs: [

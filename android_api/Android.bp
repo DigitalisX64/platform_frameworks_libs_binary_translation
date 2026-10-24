@@ -37,7 +37,7 @@ berberis_cc_defaults {
     soong_config_variables: {
         translation_arch: {
             riscv64_to_x86_64: {
-                defaults: ["berberis_defaults_64"],
+                defaults: ["berberis_riscv64_defaults"],
                 header_libs: ["libberberis_guest_abi_riscv64_headers"],
                 shared_libs: ["libberberis_riscv64"],
             },
@@ -47,7 +47,7 @@ berberis_cc_defaults {
                 shared_libs: ["libberberis_arm64"],
             },
             conditions_default: {
-                defaults: ["berberis_defaults_64"],
+                defaults: ["berberis_riscv64_defaults"],
             },
         },
     },

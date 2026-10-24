@@ -391,7 +391,7 @@ ndk_translation_package {
 // with the RISC-V TryLiteTranslateRegion.
 cc_test_host {
     name: "berberis_arm64_host_tests",
-    defaults: ["berberis_defaults"],
+    defaults: ["berberis_guest_agnostic_defaults"],
     static_libs: [
         "libberberis_assembler",
         "libberberis_base",
@@ -663,7 +663,7 @@ phony_rule_defaults {
 
 cc_library_shared {
     name: "libberberis_arm64",
-    defaults: ["berberis_defaults_64"],
+    defaults: ["berberis_guest_agnostic_defaults_64"],
     host_supported: true,
     static_libs: [
         "libbase",
