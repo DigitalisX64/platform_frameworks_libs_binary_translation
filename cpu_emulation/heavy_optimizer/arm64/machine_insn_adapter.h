@@ -17,6 +17,7 @@
 #ifndef BERBERIS_HEAVY_OPTIMIZER_ARM64_MACHINE_INSN_ADAPTER_H_
 #define BERBERIS_HEAVY_OPTIMIZER_ARM64_MACHINE_INSN_ADAPTER_H_
 
+#include <array>
 #include <tuple>
 #include <type_traits>
 
@@ -53,12 +54,19 @@
 #define BERBERIS_ARM64_INSN_SSA_MODE \
   x86_64::kForceNoSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>
 
-// The adapter's ResultType argument has to arrive as one preprocessor token:
-// spelling MachineInsn<DeviceInsnInfo, mode>::OutputArgsTuple at the call site
-// would be split at that comma and arrive as two arguments.
-#define BERBERIS_ARM64_INSN_OUTPUT_TUPLE                                                 \
-  typename x86_64::MachineInsn<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo, \
-                               BERBERIS_ARM64_INSN_SSA_MODE>::OutputArgsTuple
+// The output registers of an instruction, as the frontend's own Gen() returns
+// them. Android 16's MachineInsn::OutputArgsTuple was itself a
+// std::array<MachineReg, N>; AOSP 17 redefined it as a tuple, so spell the
+// array out rather than name OutputArgsTuple and get a tuple the forwarder
+// does not return.
+//
+// Written as a macro because the comma inside the template argument list would
+// otherwise split the adapter's ResultType argument in two.
+#define BERBERIS_ARM64_INSN_OUTPUT_REGS                                                            \
+  std::array<MachineReg,                                                                           \
+             x86_64::MachineInsn<                                                                  \
+                 typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo,              \
+                 BERBERIS_ARM64_INSN_SSA_MODE>::kInfo.OutputRegistersCount()>
 
 // The builder-style forwarder returns the instruction it generated. Spelled as
 // a macro so the comma inside the template argument list does not split the

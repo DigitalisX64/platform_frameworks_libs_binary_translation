@@ -689,7 +689,7 @@ class HeavyOptimizerFrontend {
       (, enum SSAMode kSSAMode = kSSA),
       MachineInsn,
       InputArgsTuple,
-      BERBERIS_ARM64_INSN_OUTPUT_TUPLE,
+      BERBERIS_ARM64_INSN_OUTPUT_REGS,
       Gen,
       (, kSSAMode))
 
