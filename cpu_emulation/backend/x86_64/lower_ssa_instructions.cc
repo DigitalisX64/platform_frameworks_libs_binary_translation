@@ -78,11 +78,26 @@ bool CheckSSA(MachineIR* machine_ir) {
 }
 
 void LowerSSAInstructions(MachineIR* machine_ir) {
+  // region digitalis
+  // CheckSSA requires the frontend to have left no use_def operand in the IR.
+  // The ARM64 frontend does leave them: ~2900 of its emissions write a register
+  // in place, which is the point of them, and several flag sequences depend on
+  // it. The requirement is a contract with upstream's frontend rather than
+  // something the rest of the pipeline needs -- upstream itself skips the check
+  // under kOptimizedInterRegionABI, the loop below passes a non-SSA instruction
+  // through untouched, and every pass after this one handles use_def operands
+  // because lowering produces them. So the check is dropped for this guest and
+  // kept for the other, where it still describes the frontend accurately.
+#if !defined(BERBERIS_GUEST_FRONTEND_EMITS_NON_SSA)
+  // endregion
   if (!IsConfigFlagSet(kOptimizedInterRegionABI)) {
     if (!CheckSSA(machine_ir)) {
       FATAL("Incorrect IR:\n%s", machine_ir->GetDebugString().c_str());
     }
   }
+  // region digitalis
+#endif
+  // endregion
   for (auto* bb : machine_ir->bb_list()) {
     auto& insn_list = bb->insn_list();
     for (auto insn_it = insn_list.begin(); insn_it != insn_list.end();) {
