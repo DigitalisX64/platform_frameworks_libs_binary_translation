@@ -936,8 +936,17 @@ class HeavyOptimizerFrontend {
     Register frm = AllocTempReg();
     builder_.Gen<PseudoDefReg>(frm, kMeta<&x86_64::kGeneralReg64>);
     std::tuple<MachineReg> res;
-    InlineIntrinsicForHeavyOptimizer<kFunction>(
-        &builder_, res, GetFlagsRegister(), int8_t{0b111}, frm, src1, src2);
+    // The intrinsic machinery feeds its arguments straight into the machine
+    // instruction's constructor tuple, which takes MachineReg. The riscv64
+    // frontend's FpRegister is a MachineReg so it can pass one directly; this
+    // one's is a SimdReg wrapper, so unwrap as everywhere else here.
+    InlineIntrinsicForHeavyOptimizer<kFunction>(&builder_,
+                                                res,
+                                                GetFlagsRegister(),
+                                                int8_t{0b111},
+                                                frm,
+                                                src1.machine_reg(),
+                                                src2.machine_reg());
     return FpRegister{std::get<0>(res)};
   }
 
