@@ -42,7 +42,6 @@ bool InitBerberisUnsafe() {
   InitGuestFunctionWrapper(&IsAddressGuestExecutable);
   InitTranslator();
   InitGuestSignalHandling();
-  InitCrashReporter();
   InitGuestArch();
   return true;
 }
