@@ -559,6 +559,11 @@ void GuestThread::ProcessPendingSignalsImpl() {
     const Guest_sigaction* sa = FindSignalHandler(*signal_actions_.get(), signal_info->si_signo);
     // region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    // Android 16 converted the host siginfo as the signal was enqueued, so both
+    // paths below saw guest values. Upstream converts at dequeue instead, in the
+    // branch this one replaces, so convert here -- once, ahead of both paths,
+    // because the SIGSYS arm rewrites si_syscall and is not idempotent.
+    ConvertHostSiginfoToGuest(signal_info, state_);
     if (sa) {
       ProcessGuestSignal(this, sa, signal_info);
       pending_signals_.FreeSignal(signal_info);
