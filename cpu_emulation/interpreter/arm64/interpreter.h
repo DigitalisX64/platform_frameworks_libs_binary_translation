@@ -3996,8 +3996,6 @@ class Interpreter {
   void LoadStoreExclusive(const Decoder::LoadStoreExclusiveArgs& args, Register base) {
     CHECK(!exception_raised_);
     void* host_addr = ToHostAddr<void>(ApplyTbi(base));
-    bool need_write = (args.op != Decoder::AtomicOp::kLdxr &&
-                       args.op != Decoder::AtomicOp::kLdar);
     // Atomic ops use __atomic builtins which handle their own faults via
     // the registered FaultyLoad/FaultyStore recovery code addresses.
 
