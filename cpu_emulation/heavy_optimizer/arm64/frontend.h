@@ -17,9 +17,12 @@
 #ifndef BERBERIS_HEAVY_OPTIMIZER_ARM64_FRONTEND_H_
 #define BERBERIS_HEAVY_OPTIMIZER_ARM64_FRONTEND_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <tuple>
+#include <utility>
 
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
@@ -630,20 +633,75 @@ class HeavyOptimizerFrontend {
       Gen,
       x86_64::kForceSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
 
-  // No splitting either, but the flags register is filled in for the caller,
-  // the way the pre-rework Gen() did: these callers pass only the instruction's
-  // input operands. Same forwarder as Gen() above -- the mode travels in
-  // InsnType, so GenMachineInsn sees kNoSSA and leaves a use_def operand in one
-  // register.
-  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
-      /*may_discard*/ auto GenInPlace,
-      InputArgsTuple,
-      typename x86_64::MachineInsn<
-          typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo,
-          x86_64::kForceNoSSA<typename InsnType<
-              typename CodeEmitter::Assemblers>::DeviceInsnInfo>>::OutputArgsTuple,
-      Gen,
-      x86_64::kForceNoSSA<typename InsnType<typename CodeEmitter::Assemblers>::DeviceInsnInfo>)
+  // No splitting, and the frontend fills the operands the caller does not pass:
+  // the flags register for an instruction that writes it, a fresh vreg for a
+  // write-only register operand. That is what the pre-rework Gen(kNoSSA) did,
+  // and GenMachineInsn cannot stand in for it -- it returns a {out, in} pair per
+  // use_def operand, which is the split shape this deliberately avoids.
+  //
+  // Register and immediate operands only: a memory operand would put a
+  // reference in ConstructorArgsTuple, which the assignment below cannot fill.
+  // No caller needs one today, and one that did would fail to compile here
+  // rather than silently misbehave.
+  template <typename Operand>
+  static constexpr bool kFrontendFills =
+      device_arch_info::kIsRegister<Operand> &&
+      (device_arch_info::kIsFLAGS<Operand> || Operand::kUsage == device_arch_info::kDef ||
+       Operand::kUsage == device_arch_info::kDefEarlyClobber);
+
+  template <template <typename> typename InsnTemplate, typename... Args>
+  /*may_discard*/ auto GenInPlace(Args... args) {
+    using Info = typename InsnTemplate<typename CodeEmitter::Assemblers>::DeviceInsnInfo;
+    using Insn = x86_64::MachineInsn<Info, x86_64::kForceNoSSA<Info>>;
+    using Operands = typename Info::Operands;
+    constexpr size_t kOperandCount = std::tuple_size_v<Operands>;
+
+    // Which caller argument each operand takes, for the operands the caller
+    // passes; kFilled for the ones this function supplies.
+    constexpr size_t kFilled = ~size_t{0};
+    constexpr auto kArgOf = []() {
+      std::array<size_t, kOperandCount> map{};
+      size_t next = 0;
+      [&]<size_t... kI>(std::index_sequence<kI...>) {
+        ((map[kI] = kFrontendFills<std::tuple_element_t<kI, Operands>> ? kFilled : next++), ...);
+      }(std::make_index_sequence<kOperandCount>{});
+      return map;
+    }();
+
+    auto in = std::tuple{args...};
+    std::array<MachineReg, Insn::kInfo.OutputRegistersCount()> output;
+    size_t output_index = 0;
+    typename Insn::ConstructorArgsTuple ctor_args{};
+
+    [&]<size_t... kI>(std::index_sequence<kI...>) {
+      (
+          [&]<size_t kOperand>() {
+            using Operand = std::tuple_element_t<kOperand, Operands>;
+            if constexpr (kFrontendFills<Operand>) {
+              MachineReg reg;
+              if constexpr (device_arch_info::kIsFLAGS<Operand>) {
+                reg = GetFlagsRegister();
+              } else {
+                reg = AllocTempReg();
+              }
+              std::get<kOperand>(ctor_args) = reg;
+              output[output_index++] = reg;
+            } else {
+              std::get<kOperand>(ctor_args) = std::get<kArgOf[kOperand]>(in);
+              if constexpr (device_arch_info::kIsRegister<Operand> &&
+                            Operand::kUsage == device_arch_info::kUseDef) {
+                // Written in place: the operand the caller passed is also the
+                // result.
+                output[output_index++] = std::get<kArgOf[kOperand]>(in);
+              }
+            }
+          }.template operator()<kI>(),
+          ...);
+    }(std::make_index_sequence<kOperandCount>{});
+
+    builder_.Gen<Insn>(std::move(ctor_args));
+    return output;
+  }
 
   // Emits an instruction with none of that splitting: these callers already
   // hold the registers they pass, and several sequences depend on writing a
