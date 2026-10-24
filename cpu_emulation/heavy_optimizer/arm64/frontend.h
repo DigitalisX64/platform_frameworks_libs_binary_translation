@@ -26,6 +26,7 @@
 #include "berberis/base/arena_map.h"
 #include "berberis/base/arena_vector.h"
 #include "berberis/base/checks.h"
+#include "berberis/base/float.h"
 #include "berberis/decoder/arm64/decoder.h"
 #include "berberis/decoder/arm64/semantics_player.h"
 #include "berberis/guest_state/guest_addr.h"
@@ -35,6 +36,7 @@
 #include "berberis/runtime_primitives/platform.h"
 
 #include "inline_intrinsic.h"
+#include "machine_insn_adapter.h"
 #include "simd_register.h"
 
 namespace berberis {
@@ -94,8 +96,8 @@ class HeavyOptimizerFrontend {
   static constexpr Register no_register = MachineReg{};
   using FpRegister = SimdReg;
   static constexpr SimdReg no_fp_register = SimdReg{};
-  using Float32 = intrinsics::Float32;
-  using Float64 = intrinsics::Float64;
+  using Float32 = berberis::Float32;
+  using Float64 = berberis::Float64;
 
   explicit HeavyOptimizerFrontend(x86_64::MachineIR* machine_ir, GuestAddr pc)
       : pc_(pc),
@@ -682,7 +684,7 @@ class HeavyOptimizerFrontend {
     return output;
   }
 
-  BERBERIS_DECLARE_MACHINE_INSN_ADAPTER(
+  BERBERIS_DECLARE_ARM64_MACHINE_INSN_ADAPTER(
       /*may_discard*/ auto Gen,
       (, enum SSAMode kSSAMode = kSSA),
       MachineInsn,
