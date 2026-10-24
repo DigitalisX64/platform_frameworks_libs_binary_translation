@@ -17,6 +17,7 @@
 #ifndef BERBERIS_ANDROID_API_DIGITALIS_EXTRA_PROXY_CAMERA2NDK_SHARED_CAPTURE_CALLBACKS_H_
 #define BERBERIS_ANDROID_API_DIGITALIS_EXTRA_PROXY_CAMERA2NDK_SHARED_CAPTURE_CALLBACKS_H_
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -165,7 +166,7 @@ static_assert(
 // optional callbacks need no special-casing.
 template <typename FnPtr>
 inline FnPtr WrapCallback(FnPtr guest_fn, const char* name) {
-  return WrapGuestFunction(bit_cast<GuestType<FnPtr>>(guest_fn), name);
+  return WrapGuestFunction(std::bit_cast<GuestType<FnPtr>>(guest_fn), name);
 }
 
 inline void MarshalCaptureCallbacksV2(const ACameraCaptureSession_captureCallbacksV2* guest,

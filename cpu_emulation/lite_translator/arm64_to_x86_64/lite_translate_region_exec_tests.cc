@@ -16,6 +16,7 @@
 
 #include "gtest/gtest.h"
 
+#include <bit>
 #include <csetjmp>
 #include <csignal>
 
@@ -384,7 +385,7 @@ class Arm64LiteTranslateRegionTest : public ::testing::Test {
   template <typename T>
   bool Run(T& code, GuestAddr expected_stop_addr) {
     Reset(code);
-    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    GuestAddr code_end = ToGuestAddr(std::bit_cast<char*>(&code[0]) + sizeof(code));
     MachineCode machine_code;
     auto [success, stop_pc] = TryLiteTranslateRegion(state_.cpu.insn_addr,
                                                      &machine_code,
@@ -6695,7 +6696,7 @@ TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_SpProlog) {
   // is pre-index; the others are signed-offset).
   EXPECT_EQ(state_.cpu.sp, orig_sp - 0x60);
   // All eight values must have been written to the right slots in stack_buf.
-  uint64_t* new_sp = bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.sp));
+  uint64_t* new_sp = std::bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.sp));
   EXPECT_EQ(new_sp[0], 0x29292929'29292929ULL);          // [sp, #0]   = x29
   EXPECT_EQ(new_sp[1], 0x30303030'30303030ULL);          // [sp, #8]   = x30
   EXPECT_EQ(new_sp[2], 0x28282828'28282828ULL);          // [sp, #16]  = x28
@@ -6746,7 +6747,7 @@ TEST_F(Arm64LiteTranslateRegionTest, StpX_PreIndexNegative_X1Base) {
   };
   EXPECT_TRUE(Run(code, ToGuestAddr(code) + sizeof(code)));
   EXPECT_EQ(state_.cpu.x[1], orig_x1 - 0x60);
-  uint64_t* new_x1 = bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.x[1]));
+  uint64_t* new_x1 = std::bit_cast<uint64_t*>(static_cast<uintptr_t>(state_.cpu.x[1]));
   EXPECT_EQ(new_x1[0], 0xAAAA'AAAA'AAAA'AAAAULL);
   EXPECT_EQ(new_x1[1], 0xBBBB'BBBB'BBBB'BBBBULL);
 }
@@ -36587,7 +36588,7 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
   bool RunWithDispatch(const T& code, GuestAddr expected_stop_addr) {
     state_.cpu.insn_addr = ToGuestAddr(code);
     GuestAddr code_start = ToGuestAddr(code);
-    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    GuestAddr code_end = ToGuestAddr(std::bit_cast<char*>(&code[0]) + sizeof(code));
     MachineCode machine_code;
     auto [success, stop_pc] = TryLiteTranslateRegion(state_.cpu.insn_addr,
                                                      &machine_code,
@@ -36630,7 +36631,7 @@ class Arm64LiteTranslateRegionDispatchTest : public ::testing::Test {
   bool RunMultiRegion(const T& code, GuestAddr expected_stop_addr) {
     state_.cpu.insn_addr = ToGuestAddr(code);
     GuestAddr code_start = ToGuestAddr(code);
-    GuestAddr code_end = ToGuestAddr(bit_cast<char*>(&code[0]) + sizeof(code));
+    GuestAddr code_end = ToGuestAddr(std::bit_cast<char*>(&code[0]) + sizeof(code));
     auto* cache = TranslationCache::GetInstance();
 
     HostCodeAddr first_host_code = 0;

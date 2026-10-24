@@ -75,11 +75,11 @@ TEST(TrampolineFuncGenerator64, NarrowResultClearsIncomingArgument) {
   ProcessState state{};
 
   state.cpu.x[0] = 0x0000'7755'228a'd050;
-  func(bit_cast<void*>(&Callee::NoException), &state);
+  func(std::bit_cast<void*>(&Callee::NoException), &state);
   EXPECT_EQ(0u, state.cpu.x[0]);
 
   state.cpu.x[0] = 0x0000'7755'228a'd050;
-  func(bit_cast<void*>(&Callee::Exception), &state);
+  func(std::bit_cast<void*>(&Callee::Exception), &state);
   EXPECT_EQ(1u, state.cpu.x[0]);
 }
 // endregion

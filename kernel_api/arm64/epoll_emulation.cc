@@ -20,6 +20,7 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#include <bit>
 #include <cerrno>
 #include <cstring>
 
@@ -62,7 +63,7 @@ long RunGuestSyscall___NR_epoll_ctl(long arg_1, long arg_2, long arg_3, long arg
     return syscall(__NR_epoll_ctl, arg_1, arg_2, arg_3, nullptr);
   }
 
-  Guest_epoll_event* guest_event = bit_cast<Guest_epoll_event*>(arg_4);
+  Guest_epoll_event* guest_event = std::bit_cast<Guest_epoll_event*>(arg_4);
   epoll_event host_event;
   host_event.events = guest_event->events;
   host_event.data.u64 = guest_event->data;
@@ -77,7 +78,7 @@ long RunGuestSyscall___NR_epoll_pwait(long arg_1,
                                       long arg_6) {
   long res = syscall(__NR_epoll_pwait, arg_1, arg_2, arg_3, arg_4, arg_5, arg_6);
   if (res != -1 && arg_2 != 0) {
-    ConvertHostEPollEventArrayToGuestInPlace(bit_cast<Guest_epoll_event*>(arg_2), arg_3);
+    ConvertHostEPollEventArrayToGuestInPlace(std::bit_cast<Guest_epoll_event*>(arg_2), arg_3);
   }
   return res;
 }

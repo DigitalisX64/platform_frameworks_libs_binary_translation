@@ -15,6 +15,7 @@
  */
 #include "berberis/lite_translator/lite_translate_region.h"
 
+#include <bit>
 #include <cstdint>
 #include <tuple>
 
@@ -42,7 +43,7 @@ void GenIncrementProfileCounter(x86_64::Assembler* as, const LiteTranslateParams
   CHECK(params.counter_location);
   *params.counter_location = 0;
 
-  as->Movq(as->rcx, bit_cast<int64_t>(params.counter_location));
+  as->Movq(as->rcx, std::bit_cast<int64_t>(params.counter_location));
   static_assert(sizeof(*params.counter_location) == 4);
   as->Addl({.base = as->rcx}, 1);
   as->Cmpl({.base = as->rcx}, params.counter_threshold);

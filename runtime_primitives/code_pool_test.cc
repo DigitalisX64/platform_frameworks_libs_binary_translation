@@ -124,13 +124,13 @@ class CountingExecRegionFactory {
 
   static ExecRegion Create(size_t /*size*/) {
     ++create_count;
-    auto* exec = bit_cast<uint8_t*>(MmapImplOrDie({
+    auto* exec = std::bit_cast<uint8_t*>(MmapImplOrDie({
         .size = kExecRegionSize,
         .prot = PROT_NONE,
         .flags = MAP_PRIVATE | MAP_ANONYMOUS,
         .berberis_flags = kMmapBerberis32Bit,
     }));
-    auto* write = bit_cast<uint8_t*>(MmapImplOrDie({
+    auto* write = std::bit_cast<uint8_t*>(MmapImplOrDie({
         .size = kExecRegionSize,
         .prot = PROT_READ | PROT_WRITE,
         .flags = MAP_PRIVATE | MAP_ANONYMOUS,
