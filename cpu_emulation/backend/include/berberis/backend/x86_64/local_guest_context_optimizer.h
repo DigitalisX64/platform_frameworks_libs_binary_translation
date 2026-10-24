@@ -120,6 +120,18 @@ class LocalGuestContextOptimizer {
 void RemoveLocalGuestContextAccesses(x86_64::MachineIR* machine_ir,
                                      const OptimizeLocalParams& params = OptimizeLocalParams());
 
+// region digitalis
+// Forwards guest-context reads along chains of basic blocks that a faulting
+// guest memory access split (the access's block ends in a Branch to a
+// continuation with no other predecessor, and its other successor is the
+// recovery block). Stores are kept: the recovery block exits the region and
+// reads the whole guest state. Runs before RenameVRegs, which connects the
+// forwarded values across the splits.
+void ForwardGuestContextGetsAcrossRecoverySplits(
+    x86_64::MachineIR* machine_ir,
+    const OptimizeLocalParams& params = OptimizeLocalParams());
+// endregion digitalis
+
 }  // namespace berberis::x86_64
 
 #endif  // BERBERIS_BACKEND_X86_64_LOCAL_GUEST_CONTEXT_OPTIMIZER_H_
