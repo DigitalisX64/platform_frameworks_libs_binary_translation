@@ -59,7 +59,7 @@ class MachineIRUseLeaForCopiedAddsTest : public ::testing::Test {
 };
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoAddImmediate) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();
 
@@ -75,7 +75,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoAddImmediate) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoSubImmediate) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<SubqRegImm>(dst_, 8, flags_);
   Finish();
 
@@ -89,7 +89,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoSubImmediate) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoAddRegister) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegReg>(dst_, other_, flags_);
   Finish();
 
@@ -107,7 +107,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesCopyIntoAddRegister) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, AddOfDestinationToItselfDoublesSource) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegReg>(dst_, dst_, flags_);
   Finish();
 
@@ -122,7 +122,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, AddOfDestinationToItselfDoublesSource) 
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesWhenFlagsAreOverwrittenBeforeUse) {
   MachineReg word = machine_ir_.AllocVReg();
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   builder_.Gen<CmpqRegReg>(copied_, other_, flags_);
   builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, word, flags_);
@@ -135,7 +135,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, MergesWhenFlagsAreOverwrittenBeforeUse)
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseFlagsAreRead) {
   MachineReg word = machine_ir_.AllocVReg();
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   builder_.Gen<PseudoReadFlags>(PseudoReadFlags::kWithOverflow, word, flags_);
   Finish();
@@ -146,7 +146,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseFlagsAreRead) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseCarryIsRead) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   builder_.Gen<AdcqRegImm>(other_, 0, flags_);
   Finish();
@@ -157,7 +157,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseCarryIsRead) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseFlagsLiveOut) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();
   bb_->live_out().push_back(flags_);
@@ -168,7 +168,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWhoseFlagsLiveOut) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWritingHardFlagsAtBlockEnd) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, kMachineRegFLAGS);
   Finish();
 
@@ -178,7 +178,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWritingHardFlagsAtBlockEnd) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyWhenSourceRedefined) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<MovqRegImm>(copied_, 0);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();
@@ -190,7 +190,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyWhenSourceRedefined) {
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyWhenDestinationReadFirst) {
   MachineReg sink = machine_ir_.AllocVReg();
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<MovqRegReg>(sink, dst_);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();
@@ -213,7 +213,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsAddWithoutCopy) {
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyOfVectorRegister) {
   MachineReg vector = machine_ir_.AllocVReg();
   builder_.Gen<PseudoDefXReg>(vector);
-  builder_.Gen<PseudoCopy>(dst_, vector, 8);
+  builder_.Gen<Copy>(dst_, vector, kMeta<&kGeneralReg64>);
   builder_.Gen<AddqRegImm>(dst_, 16, flags_);
   Finish();
 
@@ -223,7 +223,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsCopyOfVectorRegister) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsSubOfMostNegativeImmediate) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<SubqRegImm>(dst_, std::numeric_limits<int32_t>::min(), flags_);
   Finish();
 
@@ -233,7 +233,7 @@ TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsSubOfMostNegativeImmediate) {
 }
 
 TEST_F(MachineIRUseLeaForCopiedAddsTest, KeepsThirtyTwoBitAdd) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 8);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kGeneralReg64>);
   builder_.Gen<AddlRegImm>(dst_, 16, flags_);
   Finish();
 

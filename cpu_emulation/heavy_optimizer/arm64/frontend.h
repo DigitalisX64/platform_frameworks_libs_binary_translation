@@ -165,7 +165,7 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] Register Copy(Register value) {
     Register result = AllocTempReg();
     if (success()) {
-      builder_.Gen<PseudoCopy>(result, value, 8);
+      builder_.Gen<Copy>(result, value, kMeta<&x86_64::kGeneralReg64>);
     }
     return result;
   }
@@ -451,7 +451,7 @@ class HeavyOptimizerFrontend {
 
   // FCVTZS (op 000) / FCVTZU (op 001), truncating (rmode == 11): FP -> integer
   // via x86 CVTT{SS,SD}2SI plus the ARM by-sign saturation / NaN fix-up ladder.
-  // BB-split lowering (a shared `result` GP vreg merged via PseudoCopy). Mirrors
+  // BB-split lowering (a shared `result` GP vreg merged via Copy). Mirrors
   // lite_translator.h::FpIntConversion's FCVTZS/FCVTZU paths.
   //
   // The rounding scalar conversions FCVTNS/NU (rmode 00), FCVTPS/PU (rmode 01)
@@ -614,7 +614,7 @@ class HeavyOptimizerFrontend {
   }
 
   // Syntax sugar mirroring riscv64's Gen<> adapter. It threads guest temp
-  // registers through PseudoCopy for SSA form and dispatches to the
+  // registers through Copy for SSA form and dispatches to the
   // MachineIRBuilder.
   enum SSAMode { kSSA, kNoSSA };
 
@@ -646,9 +646,10 @@ class HeavyOptimizerFrontend {
           } else if (kSSAMode == kSSA) {
             output[output_index] = AllocTempReg();
             if (InsnType::kInfo.reg_kinds[index].IsInput()) {
-              builder_.Gen<PseudoCopy>(output[output_index],
-                                       input[input_index++],
-                                       InsnType::kInfo.reg_kinds[index].RegClass()->reg_size);
+              builder_.Gen<Copy>(
+                  output[output_index],
+                  input[input_index++],
+                  x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
             }
           } else {
             output[output_index] = input[input_index++];
@@ -660,9 +661,10 @@ class HeavyOptimizerFrontend {
         if (kSSAMode == kSSA && InsnType::kInfo.reg_kinds[index].RegClass()->num_regs == 1) {
           CHECK(InsnType::kInfo.reg_kinds[index].RegClass() != &x86_64::kFLAGS);
           gen_args[index] = AllocTempReg();
-          builder_.Gen<PseudoCopy>(gen_args[index],
-                                   input[input_index++],
-                                   InsnType::kInfo.reg_kinds[index].RegClass()->reg_size);
+          builder_.Gen<Copy>(
+              gen_args[index],
+              input[input_index++],
+              x86_64::GetRegClassForCopy(InsnType::kInfo.reg_kinds[index].RegClass()));
         } else {
           gen_args[index] = input[input_index++];
         }

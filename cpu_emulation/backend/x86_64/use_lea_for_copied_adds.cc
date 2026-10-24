@@ -32,7 +32,11 @@ bool Defines(const berberis::MachineInsn* insn, MachineReg reg) {
 
 bool Uses(const berberis::MachineInsn* insn, MachineReg reg) {
   for (int i = 0; i < insn->NumRegOperands(); i++) {
-    if (insn->RegAt(i) == reg && insn->RegKindAt(i).IsUse()) {
+    // IsInput() is false for an early-clobber operand, which still occupies
+    // the register across the instruction. Count it as a read so the
+    // flag-liveness scan below stays conservative.
+    const MachineRegKind kind = insn->RegKindAt(i);
+    if (insn->RegAt(i) == reg && (kind.IsInput() || kind.IsDefEarlyClobber())) {
       return true;
     }
   }
@@ -74,7 +78,7 @@ std::vector<bool> FindGeneralRegs(const MachineIR* machine_ir) {
   std::vector<bool> other(machine_ir->NumVReg(), false);
   for (const auto* bb : machine_ir->bb_list()) {
     for (const auto* insn : bb->insn_list()) {
-      if (insn->opcode() == kMachineOpPseudoCopy) {
+      if (insn->opcode() == kMachineOpCopy) {
         continue;
       }
       for (int i = 0; i < insn->NumRegOperands(); i++) {
@@ -162,7 +166,7 @@ bool TryMerge(MachineIR* machine_ir,
       continue;
     }
     berberis::MachineInsn* copy = *it;
-    if (copy->opcode() != kMachineOpPseudoCopy || copy->RegAt(0) != dst) {
+    if (copy->opcode() != kMachineOpCopy || copy->RegAt(0) != dst) {
       return false;
     }
     MachineReg src = copy->RegAt(1);

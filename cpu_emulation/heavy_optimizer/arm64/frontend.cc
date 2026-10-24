@@ -850,7 +850,7 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   // The false case = transform(src2), and the true case = src1, each produced
   // into a fresh 64-bit-wide value (a 32-bit op clears the upper half, matching
   // ARM64 W-write semantics). They are funneled into a single `result` vreg via
-  // PseudoCopy so that, after the conditional overwrite, `result` holds the
+  // Copy so that, after the conditional overwrite, `result` holds the
   // selected operand on every control-flow edge.
   auto width_adjust = [&](Register r) -> Register {
     if (is_64bit) {
@@ -895,11 +895,11 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   }
 
   Register result = AllocTempReg();
-  builder_.Gen<PseudoCopy>(result, false_val, 8);
+  builder_.Gen<Copy>(result, false_val, kMeta<&x86_64::kGeneralReg64>);
 
   // AL/NV: always select src1 (unconditional). No branch needed.
   if (cond == Decoder::Condition::kAl || cond == Decoder::Condition::kNv) {
-    builder_.Gen<PseudoCopy>(result, width_adjust(src1), 8);
+    builder_.Gen<Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
     return result;
   }
 
@@ -916,7 +916,7 @@ Register HeavyOptimizerFrontend::ConditionalSelect(Decoder::ConditionalSelectOpc
   EmitCondBranch(cond, then_bb, merge_bb);
 
   builder_.StartBasicBlock(then_bb);
-  builder_.Gen<PseudoCopy>(result, width_adjust(src1), 8);
+  builder_.Gen<Copy>(result, width_adjust(src1), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(then_bb, merge_bb);
   builder_.Gen<PseudoBranch>(merge_bb);
 
@@ -939,7 +939,7 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   // Divide-by-zero path writes 0; the divide path overwrites result with the
   // quotient. Both edges define `result`, so it holds the right value at merge.
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-  builder_.Gen<PseudoCopy>(result, zero, 8);
+  builder_.Gen<Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
 
   auto* ir = builder_.ir();
   auto* cur_bb = builder_.bb();
@@ -963,7 +963,7 @@ Register HeavyOptimizerFrontend::EmitUDiv(bool is_64bit, Register src1, Register
   } else {
     quotient = std::get<0>(Gen<x86_64::DivlRegRegReg>(src1, hi, src2));
   }
-  builder_.Gen<PseudoCopy>(result, quotient, 8);
+  builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
   builder_.Gen<PseudoBranch>(merge_bb);
 
@@ -983,7 +983,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
 
   Register result = AllocTempReg();
   Register zero = std::get<0>(Gen<x86_64::MovqRegImm>(int64_t{0}));
-  builder_.Gen<PseudoCopy>(result, zero, 8);
+  builder_.Gen<Copy>(result, zero, kMeta<&x86_64::kGeneralReg64>);
 
   auto* ir = builder_.ir();
   auto* cur_bb = builder_.bb();
@@ -1019,7 +1019,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
   } else {
     neg = std::get<0>(Gen<x86_64::SublRegReg, kNoSSA>(negbase, src1));
   }
-  builder_.Gen<PseudoCopy>(result, neg, 8);
+  builder_.Gen<Copy>(result, neg, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(neg_one_bb, merge_bb);
   builder_.Gen<PseudoBranch>(merge_bb);
 
@@ -1034,7 +1034,7 @@ Register HeavyOptimizerFrontend::EmitSDiv(bool is_64bit, Register src1, Register
         std::get<0>(Gen<x86_64::MovlRegReg>(src1)), int8_t{31}));
     quotient = std::get<0>(Gen<x86_64::IdivlRegRegReg>(src1, hi, src2));
   }
-  builder_.Gen<PseudoCopy>(result, quotient, 8);
+  builder_.Gen<Copy>(result, quotient, kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(div_bb, merge_bb);
   builder_.Gen<PseudoBranch>(merge_bb);
 
@@ -1470,7 +1470,7 @@ void HeavyOptimizerFrontend::EmitScvtfUcvtf(const Decoder::FpIntConvArgs& args,
 // ("indefinite") for NaN / Inf / overflow. ARM's by-sign saturation is rebuilt
 // with a BB-split fix-up ladder, bit-for-bit with lite_translator.h's FCVTZS /
 // FCVTZU paths. A single `result` GP vreg is merged across the fix-up branches
-// via PseudoCopy (mirrors ConditionalSelect); FLAGS never cross a basic block —
+// via Copy (mirrors ConditionalSelect); FLAGS never cross a basic block —
 // each UCOMI/TEST is consumed by the PseudoCondBranch in its own block.
 void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                        bool is_double,
@@ -1633,7 +1633,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
       tmp = is_double ? std::get<0>(Gen<x86_64::Cvttsd2silRegXReg>(xmm.machine_reg()))
                       : std::get<0>(Gen<x86_64::Cvttss2silRegXReg>(xmm.machine_reg()));
     }
-    builder_.Gen<PseudoCopy>(result, tmp, 8);  // default: keep tmp
+    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default: keep tmp
 
     auto* cur_bb = builder_.bb();
     MachineBasicBlock* nan_bb = ir->NewBasicBlock();
@@ -1648,7 +1648,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                    ucomi_self());
 
     builder_.StartBasicBlock(nan_bb);
-    builder_.Gen<PseudoCopy>(result, GetImm(0), 8);
+    builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 
@@ -1672,7 +1672,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
 
     builder_.StartBasicBlock(ovf_bb);
     const uint64_t int_max = args.sf ? static_cast<uint64_t>(INT64_MAX) : uint64_t{0x7FFFFFFF};
-    builder_.Gen<PseudoCopy>(result, GetImm(int_max), 8);
+    builder_.Gen<Copy>(result, GetImm(int_max), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 
@@ -1706,7 +1706,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
 
     builder_.StartBasicBlock(pos_bb);
     Register tmp = cvtt_q(xmm);
-    builder_.Gen<PseudoCopy>(result, tmp, 8);  // default in-range
+    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);  // default in-range
     Register hi = std::get<0>(Gen<x86_64::ShrqRegImm, kNoSSA>(Copy(tmp), int8_t{32}));
     Register hi_flags = std::get<0>(Gen<x86_64::TestqRegReg>(hi, hi));
     ir->AddEdge(pos_bb, done_bb);
@@ -1714,7 +1714,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kZero, done_bb, ovf_bb, hi_flags);
 
     builder_.StartBasicBlock(ovf_bb);
-    builder_.Gen<PseudoCopy>(result, GetImm(uint64_t{0xFFFFFFFF}), 8);
+    builder_.Gen<Copy>(result, GetImm(uint64_t{0xFFFFFFFF}), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(ovf_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
   } else {
@@ -1749,7 +1749,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                    lt_flags);
 
     builder_.StartBasicBlock(direct_bb);
-    builder_.Gen<PseudoCopy>(result, cvtt_q(xmm), 8);
+    builder_.Gen<Copy>(result, cvtt_q(xmm), kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(direct_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 
@@ -1767,7 +1767,7 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
                                    ge_flags);
 
     builder_.StartBasicBlock(satmax_bb);
-    builder_.Gen<PseudoCopy>(result, GetImm(~uint64_t{0}), 8);  // UINT64_MAX
+    builder_.Gen<Copy>(result, GetImm(~uint64_t{0}), kMeta<&x86_64::kGeneralReg64>);  // UINT64_MAX
     ir->AddEdge(satmax_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 
@@ -1784,13 +1784,13 @@ void HeavyOptimizerFrontend::EmitFcvtz(const Decoder::FpIntConvArgs& args,
     }
     Register tmp = cvtt_q(xsub);
     tmp = std::get<0>(Gen<x86_64::BtsqRegImm, kNoSSA>(tmp, int8_t{63}));
-    builder_.Gen<PseudoCopy>(result, tmp, 8);
+    builder_.Gen<Copy>(result, tmp, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(inrange_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
   }
 
   builder_.StartBasicBlock(zero_bb);
-  builder_.Gen<PseudoCopy>(result, GetImm(0), 8);
+  builder_.Gen<Copy>(result, GetImm(0), kMeta<&x86_64::kGeneralReg64>);
   ir->AddEdge(zero_bb, done_bb);
   builder_.Gen<PseudoBranch>(done_bb);
 
@@ -2314,12 +2314,12 @@ void HeavyOptimizerFrontend::LoadStoreExclusive(const Decoder::LoadStoreExclusiv
       builder_.Gen<PseudoCondBranch>(keep_old, pick_old_bb, pick_op_bb, cmp_flags);
 
       builder_.StartBasicBlock(pick_old_bb);
-      builder_.Gen<PseudoCopy>(new_val, old, 8);
+      builder_.Gen<Copy>(new_val, old, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_old_bb, cmpxchg_bb);
       builder_.Gen<PseudoBranch>(cmpxchg_bb);
 
       builder_.StartBasicBlock(pick_op_bb);
-      builder_.Gen<PseudoCopy>(new_val, operand, 8);
+      builder_.Gen<Copy>(new_val, operand, kMeta<&x86_64::kGeneralReg64>);
       ir->AddEdge(pick_op_bb, cmpxchg_bb);
       builder_.Gen<PseudoBranch>(cmpxchg_bb);
 
@@ -4827,7 +4827,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     Register r = std::get<0>(Gen<x86_64::AddlRegImm, kNoSSA>(Copy(bits), int32_t{0x7FFF}));
     r = std::get<0>(Gen<x86_64::AddlRegReg, kNoSSA>(r, lsb));
     r = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(r, int8_t{16}));
-    builder_.Gen<PseudoCopy>(out, r, 8);
+    builder_.Gen<Copy>(out, r, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(rtne_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 
@@ -4835,7 +4835,7 @@ void HeavyOptimizerFrontend::FpDataProc1(const Decoder::FpDataProc1Args& args) {
     builder_.StartBasicBlock(nan_bb);
     Register n = std::get<0>(Gen<x86_64::ShrlRegImm, kNoSSA>(Copy(bits), int8_t{16}));
     n = std::get<0>(Gen<x86_64::OrlRegImm, kNoSSA>(n, int32_t{0x0040}));
-    builder_.Gen<PseudoCopy>(out, n, 8);
+    builder_.Gen<Copy>(out, n, kMeta<&x86_64::kGeneralReg64>);
     ir->AddEdge(nan_bb, done_bb);
     builder_.Gen<PseudoBranch>(done_bb);
 

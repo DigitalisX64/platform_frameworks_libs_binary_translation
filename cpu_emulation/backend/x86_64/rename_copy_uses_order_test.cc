@@ -65,7 +65,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseOfRegisterTheSameInsnRedefines) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<MovdqaXRegXReg>(src, src);
-  builder.Gen<PseudoCopy>(copy, src, 16);
+  builder.Gen<Copy>(copy, src, kMeta<&kXmmReg>);
   // pmovsxbw copy, copy: widens in place, as the frontend's narrow-to-wide lowerings do.
   auto* widen = builder.Gen<PmovsxbwXRegXReg>(copy, copy);
   builder.Gen<PmullwXRegXReg>(copy, src);
@@ -93,7 +93,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseNotRenamedToRegisterTheSameInsnRedefin
   MachineReg sum = machine_ir.AllocVReg();
 
   builder.StartBasicBlock(bb);
-  builder.Gen<PseudoCopy>(copy, src, 8);
+  builder.Gen<Copy>(copy, src, kMeta<&kGeneralReg64>);
   builder.Gen<SubqRegImm>(src, 1, kMachineRegFLAGS);
   // The copy's source changed after the copy: the old value lives only in `copy`.
   auto* add = builder.Gen<AddqRegReg>(sum, copy, kMachineRegFLAGS);
@@ -114,7 +114,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseNotRenamedToEarlyClobberDef) {
   MachineReg copy = machine_ir.AllocVReg();
 
   builder.StartBasicBlock(bb);
-  builder.Gen<PseudoCopy>(copy, src, 8);
+  builder.Gen<Copy>(copy, src, kMeta<&kGeneralReg64>);
   // The clobber is written before `copy` is read, so `copy` must not become `src`.
   auto* insn = builder.Gen<EarlyClobberTestInsn>(copy, src);
   builder.Gen<PseudoJump>(kNullGuestAddr);

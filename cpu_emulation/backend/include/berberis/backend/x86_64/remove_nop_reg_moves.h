@@ -8,8 +8,8 @@ namespace berberis::x86_64 {
 // After register allocation, removes explicit register moves whose source and
 // destination got the same host register and whose result equals their input
 // (MOVDQA, MOVSD, MOVSS between XMM registers, 64-bit MOVQ). MOVL is kept: it
-// clears the upper half of its destination. The PseudoCopy counterpart is
-// RemoveNopPseudoCopy.
+// clears the upper half of its destination. The Copy counterpart is
+// RemoveNopCopy.
 void RemoveNopRegMoves(MachineIR* machine_ir);
 
 }  // namespace berberis::x86_64

@@ -727,7 +727,7 @@ TEST(MachineIRLocalGuestContextOptimizer, ForwardsSameWidthSimdGet) {
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   auto* second_insn = *std::next(bb->insn_list().begin());
-  EXPECT_EQ(second_insn->opcode(), kMachineOpPseudoCopy);
+  EXPECT_EQ(second_insn->opcode(), kMachineOpCopy);
   EXPECT_EQ(second_insn->RegAt(0), second);
   EXPECT_EQ(second_insn->RegAt(1), first);
 }
@@ -752,7 +752,7 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardsPutAcrossSplit) {
   // The store stays for the recovery exit; the read becomes a copy.
   EXPECT_EQ((*bb->insn_list().begin())->opcode(), kMachineOpMovqMemBaseDispReg);
   auto* get = *next->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), read);
   EXPECT_EQ(get->RegAt(1), value);
 }
@@ -776,7 +776,7 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardsGetAlongChain) {
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   auto* get = *last->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), second);
   EXPECT_EQ(get->RegAt(1), first);
 }
@@ -935,7 +935,7 @@ TEST(MachineIRRecoverySplitGetForwarding, DistantValueIsReloadedAndCarriedOn) {
 
   EXPECT_EQ((*std::next(next->insn_list().begin(), 40))->opcode(), kMachineOpMovqRegMemBaseDisp);
   auto* get = *last->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), again);
   EXPECT_EQ(get->RegAt(1), reloaded);
 }
@@ -968,10 +968,10 @@ TEST(MachineIRRecoverySplitGetForwarding, ForwardedGetRestartsDistance) {
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   auto* get = *std::next(next->insn_list().begin(), 20);
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(1), first);
   get = *std::next(next->insn_list().begin(), 41);
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), third);
   EXPECT_EQ(get->RegAt(1), second);
 }
@@ -998,7 +998,7 @@ TEST(MachineIRRecoverySplitGetForwarding, SameBlockGetIsLeftToLocalPass) {
 
   EXPECT_EQ((*std::next(bb->insn_list().begin()))->opcode(), kMachineOpMovqRegMemBaseDisp);
   auto* get = *next->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), later);
   EXPECT_EQ(get->RegAt(1), value);
 }
@@ -1031,10 +1031,10 @@ TEST(MachineIRRecoverySplitGetForwarding, NarrowSimdZeroExtendsOnlyStoredValues)
   ASSERT_EQ(x86_64::CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   auto* get = *next->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(1), loaded);
   get = *next2->insn_list().begin();
-  ASSERT_EQ(get->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(get->opcode(), kMachineOpCopy);
   EXPECT_EQ(get->RegAt(0), second);
   EXPECT_EQ(get->RegAt(1), first);
   get = *next3->insn_list().begin();

@@ -8,7 +8,7 @@ namespace berberis::x86_64 {
 // Before register allocation, merges a copy into the 64-bit addition that
 // overwrites it when nothing reads the flags the addition writes:
 //
-//   PseudoCopy d, a          (d not used before the add, a not redefined)
+//   Copy d, a          (d not used before the add, a not redefined)
 //   ...
 //   ADDQ d, imm              (or SUBQ d, imm, or ADDQ d, b)
 // into

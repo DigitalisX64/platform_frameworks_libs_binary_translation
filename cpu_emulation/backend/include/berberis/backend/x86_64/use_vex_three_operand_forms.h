@@ -8,7 +8,7 @@ namespace berberis::x86_64 {
 // Before register allocation, merges a copy into the two-address SSE
 // operation that overwrites it, using the operation's three-operand AVX form:
 //
-//   PseudoCopy d, a          (d not used before op, a not redefined)
+//   Copy d, a          (d not used before op, a not redefined)
 //   ...
 //   OP d, b                  (or OP d, imm)
 // into

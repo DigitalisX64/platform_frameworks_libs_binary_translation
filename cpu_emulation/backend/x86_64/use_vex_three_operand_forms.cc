@@ -194,7 +194,7 @@ bool TryMerge(MachineIR* machine_ir, MachineBasicBlock* bb, MachineInsnList::ite
       continue;
     }
     berberis::MachineInsn* copy = *it;
-    if (copy->opcode() != kMachineOpPseudoCopy || copy->RegAt(0) != dst) {
+    if (copy->opcode() != kMachineOpCopy || copy->RegAt(0) != dst) {
       return false;
     }
     MachineReg src = copy->RegAt(1);

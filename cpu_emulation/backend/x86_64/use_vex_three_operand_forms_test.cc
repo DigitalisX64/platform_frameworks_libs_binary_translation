@@ -50,7 +50,7 @@ class MachineIRUseVexThreeOperandFormsTest : public ::testing::Test {
 };
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyIntoRegisterForm) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PsubdXRegXReg>(dst_, other_);
   Finish();
 
@@ -64,11 +64,11 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyIntoRegisterForm) {
   EXPECT_EQ(op->RegAt(1), copied_);
   EXPECT_EQ(op->RegAt(2), other_);
   EXPECT_TRUE(op->RegKindAt(0).IsDef());
-  EXPECT_FALSE(op->RegKindAt(0).IsUse());
+  EXPECT_FALSE(op->RegKindAt(0).IsInput());
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyIntoImmediateForm) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PsrldqXRegImm>(dst_, int8_t{8});
   Finish();
 
@@ -84,7 +84,7 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyIntoImmediateForm) {
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyAcrossUnrelatedInstructions) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PaddqXRegXReg>(other_, copied_);
   builder_.Gen<PmaddwdXRegXReg>(dst_, other_);
   Finish();
@@ -101,7 +101,7 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, MergesCopyAcrossUnrelatedInstructio
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, ReadsCopiedRegisterForOwnDestination) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PhadddXRegXReg>(dst_, dst_);
   Finish();
 
@@ -116,7 +116,7 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, ReadsCopiedRegisterForOwnDestinatio
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsScalarOperationInSourceOrder) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<SubsdXRegXReg>(dst_, other_);
   Finish();
 
@@ -129,26 +129,26 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsScalarOperationInSourceOrder) 
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWhoseCopiedRegisterChanges) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PxorXRegXReg>(copied_, copied_);
   builder_.Gen<PadddXRegXReg>(dst_, other_);
   Finish();
 
   UseVexThreeOperandForms(&machine_ir_);
 
-  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpCopy);
   EXPECT_EQ(InsnAt(4)->opcode(), kMachineOpPadddXRegXReg);
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWhoseDestinationIsUsedBefore) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<PaddqXRegXReg>(other_, dst_);
   builder_.Gen<PadddXRegXReg>(dst_, other_);
   Finish();
 
   UseVexThreeOperandForms(&machine_ir_);
 
-  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpCopy);
   EXPECT_EQ(InsnAt(4)->opcode(), kMachineOpPadddXRegXReg);
 }
 
@@ -164,13 +164,13 @@ TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWithoutCopy) {
 }
 
 TEST_F(MachineIRUseVexThreeOperandFormsTest, KeepsOperationWithoutAvxForm) {
-  builder_.Gen<PseudoCopy>(dst_, copied_, 16);
+  builder_.Gen<Copy>(dst_, copied_, kMeta<&kXmmReg>);
   builder_.Gen<AesencXRegXReg>(dst_, other_);
   Finish();
 
   UseVexThreeOperandForms(&machine_ir_);
 
-  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpPseudoCopy);
+  ASSERT_EQ(InsnAt(2)->opcode(), kMachineOpCopy);
   EXPECT_EQ(InsnAt(3)->opcode(), kMachineOpAesencXRegXReg);
 }
 
