@@ -28,6 +28,30 @@
 
 namespace berberis::x86_64 {
 
+// region digitalis
+ContextAccess GetContextAccess(const berberis::MachineInsn* insn) {
+  switch (insn->opcode()) {
+    case kMachineOpMovwRegMemBaseDisp:
+    case kMachineOpMovwMemBaseDispReg:
+      return {2, false};
+    case kMachineOpMovqRegMemBaseDisp:
+    case kMachineOpMovqMemBaseDispReg:
+    case kMachineOpMovqMemBaseDispImm:
+      return {8, false};
+    case kMachineOpMovsdXRegMemBaseDisp:
+    case kMachineOpMovsdMemBaseDispXReg:
+      return {8, true};
+    case kMachineOpMovdqaXRegMemBaseDisp:
+    case kMachineOpMovdqaMemBaseDispXReg:
+      return {16, true};
+    default:
+      // Not a recognized context access; IsCPUStateGet/Put gate every caller.
+      return {16, false};
+  }
+}
+// endregion
+
+
 using OffsetCounterMap = ArenaVector<std::pair<size_t, int>>;
 
 void LocalGuestContextOptimizer::UnmapOlderThan(size_t pos, RegType reg_type_to_unmap) {
@@ -178,8 +202,16 @@ std::optional<MachineReg> LocalGuestContextOptimizer::ReplaceGetAndUpdateMap(
 
   // We only need to keep this load instruction if this is the first access to
   // the guest context at disp.
-  if (!mem_reg_map[disp].has_value()) {
-    mem_reg_map[disp] = {dst, {}};
+  // region digitalis
+  // A narrower mapping cannot serve a wider read -- a 64-bit MOVSD get zeroes the
+  // upper half of its XMM, so it does not hold the bits a later 128-bit read of the
+  // same slot needs. Forwarding it silently zeroed a vector register's upper half
+  // (seen as a wrong bcrypt key expansion with no crash), so re-map instead.
+  auto access = GetContextAccess(*insn_it);
+  if (!mem_reg_map[disp].has_value() || mem_reg_map[disp].value().access.size < access.size ||
+      mem_reg_map[disp].value().access.is_simd != access.is_simd) {
+    mem_reg_map[disp] = {dst, {}, access};
+  // endregion
     return std::nullopt;
   }
 
@@ -220,7 +252,13 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineBasicBlock* bb,
   auto disp = insn->disp();
   auto& mem_reg_map = context_map_.mem_reg_map;
 
-  if (mem_reg_map[disp].has_value() && mem_reg_map[disp].value().last_store.has_value()) {
+  // region digitalis
+  // A narrower store does not fully overwrite a wider one, so only drop the
+  // earlier store when this one covers every byte of it.
+  auto store_access = GetContextAccess(*insn_it);
+  if (mem_reg_map[disp].has_value() && mem_reg_map[disp].value().last_store.has_value() &&
+      mem_reg_map[disp].value().access.size <= store_access.size) {
+  // endregion
     // Remove the last store instruction.
     auto last_store_it = mem_reg_map[disp].value().last_store.value();
     bb->insn_list().erase(last_store_it);
@@ -232,7 +270,9 @@ void LocalGuestContextOptimizer::ReplacePutAndUpdateMap(MachineBasicBlock* bb,
   } else {
     new_value = insn->RegAt(1);
   }
-  mem_reg_map[disp] = {new_value, {insn_it}};
+  // region digitalis
+  mem_reg_map[disp] = {new_value, {insn_it}, GetContextAccess(*insn_it)};
+  // endregion
 }
 
 void LocalGuestContextOptimizer::PrepareGlobalMappingsForSuccessors(

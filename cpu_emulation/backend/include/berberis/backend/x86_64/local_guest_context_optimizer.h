@@ -38,9 +38,22 @@ struct PredecessorReg {
 };
 
 using MappedValue = std::variant<MachineReg, uint64_t, PredecessorReg>;
+// region digitalis
+// Bytes of the CPU-state slot a guest-context access actually touches, and
+// whether it goes through an SIMD register. mem_reg_map is keyed by offset
+// alone, so a mapping is only interchangeable with an access of the same
+// register class that touches no more bytes than the mapping recorded.
+struct ContextAccess {
+  size_t size;
+  bool is_simd;
+};
+// endregion
 struct MappedRegUsage {
   MappedValue value;
   std::optional<MachineInsnList::iterator> last_store;
+  // region digitalis
+  ContextAccess access;
+  // endregion
 };
 
 using MemRegUsageMap = ArenaVector<std::optional<MappedRegUsage>>;

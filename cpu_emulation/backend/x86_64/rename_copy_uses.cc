@@ -191,15 +191,24 @@ void RenameCopyUsesInBasicBlock(MachineBasicBlock* bb,
                                 DuplicateLiveOutsMap* duplicate_live_outs_map) {
   rename_copy_uses_map->StartBasicBlock(bb);
   for (auto* insn : bb->insn_list()) {
+    // region digitalis
+    // An instruction reads its uses before it writes its defs, so rename every use
+    // first: otherwise a def that comes earlier in the operand list (`pmovsxbw x, x`
+    // after `x = copy y`) drops the mapping its own use still needs, and the copy
+    // stays. Upstream still interleaves both in one pass.
     for (int i = 0; i < insn->NumRegOperands(); ++i) {
       // Note that Def-Use operands cannot be renamed, so we handle them as Defs.
+      if (!insn->RegKindAt(i).IsDef()) {
+        rename_copy_uses_map->RenameUseIfMapped(insn, i);
+      }
+    }  // for use operand in insn
+    for (int i = 0; i < insn->NumRegOperands(); ++i) {
       if (insn->RegKindAt(i).IsDef()) {
         rename_copy_uses_map->ProcessDef(insn, i);
         duplicate_live_outs_map->ProcessDef(bb, insn, i);
-      } else {
-        rename_copy_uses_map->RenameUseIfMapped(insn, i);
       }
-    }  // for operand in insn
+    }  // for def operand in insn
+    // endregion
 
     // Note that we intentionally rename copy's use before attempting to create a mapping, so that
     // the existing mappings are applied and propagated further.
