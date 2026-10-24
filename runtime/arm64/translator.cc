@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "berberis/runtime/translator.h"
+#include "berberis/translator/translator.h"
 #include "translator.h"
 
 #include <cstdint>
