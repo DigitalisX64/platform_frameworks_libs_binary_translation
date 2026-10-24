@@ -26,6 +26,7 @@
 #include <sys/utsname.h>
 #include <time.h>
 
+#include <bit>
 #include <cerrno>
 #include <cstring>
 
@@ -40,7 +41,7 @@
 #include "berberis/kernel_api/syscall_emulation_common.h"
 
 #include "berberis/guest_os_primitives/scoped_pending_signals.h"
-#include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_library/runtime_library.h"
 
 #include "epoll_emulation.h"
 #include "guest_types.h"
@@ -151,11 +152,11 @@ long RunGuestSyscall___NR_ioctl(long arg_1, long arg_2, long arg_3) {
 long RunGuestSyscall___NR_newfstatat(long arg_1, long arg_2, long arg_3, long arg_4) {
   struct stat host_stat;
   int result = FstatatForGuest(static_cast<int>(arg_1),       // dirfd
-                               bit_cast<const char*>(arg_2),  // path
+                               std::bit_cast<const char*>(arg_2),  // path
                                &host_stat,
                                static_cast<int>(arg_4));  // flags
   if (result != -1) {
-    ConvertHostStatToGuestArch(host_stat, bit_cast<GuestAddr>(arg_3));
+    ConvertHostStatToGuestArch(host_stat, std::bit_cast<GuestAddr>(arg_3));
   }
   return result;
 }

@@ -49,7 +49,7 @@
 #include "berberis/guest_loader/guest_loader.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
-#include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_library/runtime_library.h"
 
 namespace berberis {
 

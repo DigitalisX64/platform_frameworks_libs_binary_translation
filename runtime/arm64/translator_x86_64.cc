@@ -34,7 +34,7 @@
 #include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/host_code.h"
-#include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_library/runtime_library.h"
 #include "berberis/runtime_primitives/translation_cache.h"
 
 namespace berberis {

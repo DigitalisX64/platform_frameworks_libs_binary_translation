@@ -36,7 +36,7 @@
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/kernel_api/run_guest_syscall.h"
 #include "berberis/runtime_primitives/interpret_helpers.h"
-#include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_library/runtime_library.h"
 
 namespace berberis {
 

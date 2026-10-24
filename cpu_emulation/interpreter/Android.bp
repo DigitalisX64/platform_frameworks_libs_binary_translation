@@ -106,6 +106,7 @@ cc_library_static {
         "libberberis_guest_state_arm64_headers",
         "libberberis_interpreter_arm64_headers",
         "libberberis_kernel_api_headers",
+        "libberberis_runtime_library_headers",
         "libberberis_runtime_primitives_headers",
     ],
     export_header_lib_headers: ["libberberis_interpreter_arm64_headers"],
@@ -158,6 +159,7 @@ cc_test_library {
         "libberberis_guest_state_arm64_headers",
         "libberberis_interpreter_arm64_headers",
         "libberberis_kernel_api_headers",
+        "libberberis_runtime_library_headers",
         "libberberis_runtime_primitives_headers",
     ],
 }
