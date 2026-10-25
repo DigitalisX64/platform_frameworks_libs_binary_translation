@@ -82,6 +82,33 @@ void LocalGuestContextOptimizer::UnmapOlderThan(size_t pos, RegType reg_type_to_
   }
 }
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// A destructive two-address op (e.g. `psubd xn, xm`, which holds xn as kUseDef)
+// mutates xn in place, so a mapping that recorded xn as holding a guest context
+// slot is stale the moment the op runs and must not be forwarded to a later get
+// of that slot. Without this, `sub v5.2s, v0.2s, v5.2s; cmhi v0.2s, v5.2s, v0.2s`
+// read the pre-sub value and produced a wrong vector compare with no crash.
+// Upstream's riscv64 frontend never redefines a register while it is mapped, so
+// this never fires for that guest.
+void LocalGuestContextOptimizer::InvalidateMappingsForDefs(const berberis::MachineInsn* insn) {
+  MemRegUsageMap& mem_reg_map = context_map_.mem_reg_map;
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (!insn->RegKindAt(i).IsDef()) {
+      continue;
+    }
+    MachineReg def_reg = insn->RegAt(i);
+    for (auto& mapping : mem_reg_map) {
+      if (mapping.has_value() && std::holds_alternative<MachineReg>(mapping.value().value) &&
+          std::get<MachineReg>(mapping.value().value) == def_reg) {
+        mapping = std::nullopt;
+      }
+    }
+  }
+}
+#endif
+// endregion
+
 void LocalGuestContextOptimizer::RemoveLocalGuestContextAccesses() {
   MachineBasicBlockList nonloop_nodes(machine_ir_->arena());
   // We need reverse post order for global guest context optimization.
@@ -106,6 +133,14 @@ void LocalGuestContextOptimizer::RemoveLocalGuestContextAccesses() {
       if (reg_counter.RegCountAt(pos, RegType::kXmm) >= params_.simd_reg_limit) {
         UnmapOlderThan(pos, RegType::kXmm);
       }
+
+      // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+      // Must run before this insn's own get records its destination, so that a
+      // get does not self-invalidate the mapping it is about to establish.
+      InvalidateMappingsForDefs(*insn_it);
+#endif
+      // endregion
 
       if (machine_ir_->IsCPUStateGet(*insn_it) || machine_ir_->IsCPUStatePut(*insn_it)) {
         auto* insn = AsMachineInsnX86_64(*insn_it);

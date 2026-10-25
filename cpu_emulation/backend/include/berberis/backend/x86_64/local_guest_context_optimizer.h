@@ -106,6 +106,12 @@ class LocalGuestContextOptimizer {
                                           const MachineBasicBlockList& nonloop_nodes);
   // Updates register lifetimes and mem_reg_map when a register's lifetime is extended.
   void UpdateRegLastUse(MachineReg reg, size_t new_pos, uint32_t offset);
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // Drops every mapping whose register this instruction redefines.
+  void InvalidateMappingsForDefs(const berberis::MachineInsn* insn);
+#endif
+  // endregion
 
   MachineIR* machine_ir_;
   ContextMapping context_map_;
