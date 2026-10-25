@@ -320,7 +320,20 @@ void OptimizeLoop(MachineIR* machine_ir, Loop* loop, const OptimizeLoopParams& p
     if (unmappable_offsets.at(offset)) {
       continue;
     }
-    // endregion digitalis
+    // Never hoist the guest flags slot into a register around a loop. Upstream's
+    // only guest has no such slot -- riscv64's DoesCpuStateHaveFlags() is false
+    // and its GetThreadStateFlagOffset() CHECK-fails -- so this pass has never
+    // had to keep one live across a loop, and doing so for the ARM64 guest
+    // produces a region that computes wrong results: several Unity titles
+    // rendered a blank frame, while the same regions are correct in the lite
+    // tier, in the interpreter, and with this pass disabled.
+    //
+    // The slot is also the least rewarding thing to hoist, since nearly every
+    // guest instruction writes it, so leaving it in memory costs almost nothing.
+    if (DoesCpuStateHaveFlags() && offset == GetThreadStateFlagOffset()) {
+      continue;
+    }
+    // endregion
     // TODO(b/232598137) Account for f and v register classes.
     // Simd regs.
     if (IsSimdOffset(offset)) {
