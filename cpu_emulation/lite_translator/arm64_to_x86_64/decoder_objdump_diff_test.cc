@@ -46,9 +46,10 @@ namespace {
 
 // Committed test data. Soong's `data:` keeps the source-relative path, so these
 // install under <test binary dir>/decoder/arm64_test/.
-constexpr const char* kCorpusFile = "decoder/arm64_test/arm64_decoder_encodings.txt";
+constexpr const char* kCorpusFile =
+    "cpu_emulation/decoder/arm64_test/arm64_decoder_encodings.txt";
 constexpr const char* kUndefinedBaselineFile =
-    "decoder/arm64_test/arm64_decoder_undefined_baseline.txt";
+    "cpu_emulation/decoder/arm64_test/arm64_decoder_undefined_baseline.txt";
 
 // Records the decoder's chosen handler + key discriminating fields. One instance
 // is reused per Decode() call (cleared by re-decode). Every InsnConsumer method

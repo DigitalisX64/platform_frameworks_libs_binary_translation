@@ -77,8 +77,10 @@ namespace berberis {
 
 namespace {
 
-constexpr const char* kCorpusFile = "decoder/arm64_test/arm64_decoder_encodings.txt";
-constexpr const char* kTableFile = "heavy_optimizer/arm64/arm64_tier_coverage.txt";
+constexpr const char* kCorpusFile =
+    "cpu_emulation/decoder/arm64_test/arm64_decoder_encodings.txt";
+constexpr const char* kTableFile =
+    "cpu_emulation/heavy_optimizer/arm64/arm64_tier_coverage.txt";
 
 std::string DataPath(const char* name) {
   return android::base::GetExecutableDirectory() + "/" + name;
