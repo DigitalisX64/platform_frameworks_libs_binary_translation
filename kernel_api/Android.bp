@@ -234,9 +234,12 @@ cc_library_static {
         "libberberis_runtime_library_headers",
         "libberberis_runtime_primitives_headers",
     ],
-    whole_static_libs: [
-        "libberberis_kernel_api_common",
-    ],
+    // Deliberately does NOT whole_static_lib libberberis_kernel_api_common:
+    // this target compiles the same guest-agnostic sources itself, under
+    // -DNATIVE_BRIDGE_GUEST_ARCH_ARM64. Pulling in the common archive too
+    // would place a second, macro-less copy of each of them (open_emulation,
+    // sys_mman_emulation, ...) in this archive, and the linker would silently
+    // pick either one -- dropping the arm64-guest behaviour with no build error.
     export_header_lib_headers: ["libberberis_kernel_api_headers"],
     multilib: {
         lib32: {
