@@ -700,7 +700,22 @@ std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldContextReadA
 template <bool kIsMemWrite>
 std::tuple<FoldingType, berberis::MachineInsn*> InsnFolding::TryFoldScaleIntoMemAccess(
     const berberis::MachineInsn* insn) {
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // x86-64 addressing offers a single scale field, so an access that already
+  // scales its index cannot also absorb a shift into it. The arm64 frontend
+  // reaches this with scaled table lookups (e.g. the URECPE estimate table),
+  // where upstream's riscv64 frontend only ever emits kTimesOne, so bail out
+  // rather than assert.
+  if (AsMachineInsnX86_64(insn)->scale() != Assembler::ScaleFactor::kTimesOne) {
+    return {FoldingType::kImpossible, nullptr};
+  }
+#else
+  // endregion
   CHECK_EQ(AsMachineInsnX86_64(insn)->scale(), Assembler::ScaleFactor::kTimesOne);
+  // region digitalis
+#endif
+  // endregion
   MachineReg index_reg = insn->RegAt(kIsMemWrite ? 1 : 2);
   auto non_copy_def_opt = def_map_.FindNonCopyDef(index_reg);
   if (!non_copy_def_opt.has_value()) {
