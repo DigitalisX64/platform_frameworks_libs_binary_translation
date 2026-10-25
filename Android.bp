@@ -676,14 +676,13 @@ cc_library_shared {
         "libberberis_tinyloader",
     ],
     whole_static_libs: [
-        // region digitalis: arm64-translation variant of proxy_loader, defines
+        // arm64-translation variant of proxy_loader, defines
         // -DNATIVE_BRIDGE_GUEST_ARCH_ARM64 so the Digitalis fast-path extras
         // (RegisterExtraTrampolines + InterceptSymbol extras-search block)
         // compile in. Upstream libberberis_proxy_loader stays in use by other
         // (riscv64) translation builds — see proxy_loader/Android.bp for the
         // shared-source rationale.
         "libberberis_proxy_loader_arm64",
-        // endregion
     ],
     export_static_lib_headers: [
         "libberberis_proxy_loader_arm64",
@@ -726,19 +725,17 @@ cc_library_shared {
                 "libberberis_jni_arm64",
                 "libberberis_native_activity_arm64",
                 "libberberis_native_bridge_arm64",
-                // region digitalis: companion static library carrying Digitalis-side
-                // fast-path trampolines (libc + libm) for symbols not covered by the
+                // Companion static library carrying Digitalis-side fast-path
+                // trampolines (libc + libm) for symbols not covered by the
                 // upstream libberberis_proxy_libc / libberberis_proxy_libm. Pulled
                 // in whole so its __attribute__((constructor)) registers extras with
                 // ProxyLibraryBuilder at load time. Upstream proxy libs are untouched.
                 "libberberis_digitalis_extra_proxy_arm64",
-                // endregion
             ],
             static_libs: [
-                // region digitalis: APK extract fallback uses libziparchive in native_bridge_arm64.
+                // APK extract fallback uses libziparchive in native_bridge_arm64.
                 "libziparchive",
                 "libz",
-                // endregion
             ],
             shared_libs: [
                 "libandroid",

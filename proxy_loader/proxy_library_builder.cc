@@ -80,9 +80,7 @@ void DoGracefulBadTrampoline(HostCode callee, ThreadState* state) {
   GetCPUState(*state).x[0] = 0;
 }
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
-// endregion
 
-// region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 namespace {
 
