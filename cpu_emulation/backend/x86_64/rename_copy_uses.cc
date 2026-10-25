@@ -45,6 +45,17 @@ void RenameCopyUsesMap::RenameUseIfMapped(berberis::MachineInsn* insn, int i) {
   }
   // Renaming is only possible for USE without DEF.
   MachineReg mapped = Get(reg);
+  // region digitalis
+  // An early-clobber def is written before the uses are read, so a use must never be renamed
+  // to the register it clobbers.
+  if (mapped != kInvalidMachineReg) {
+    for (int j = 0; j < insn->NumRegOperands(); ++j) {
+      if (insn->RegKindAt(j).IsDefEarlyClobber() && insn->RegAt(j) == mapped) {
+        return;
+      }
+    }
+  }
+  // endregion
   if (mapped != kInvalidMachineReg) {
     insn->SetRegAt(i, mapped);
   }

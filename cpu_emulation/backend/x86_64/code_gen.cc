@@ -90,26 +90,21 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     FoldInsns(machine_ir);
     // Call this after all phases that create copy instructions.
     // region digitalis
-    // Skipped for this guest. RenameCopyUses maps a copy's destination to its
-    // source and requires that no mapped register is itself mapped --
-    // ComputeDuplicateLiveOuts CHECKs it and then feeds the pair to
-    // SaveDuplicates, so a chain would not merely fail validation, it would
-    // record the wrong duplicate. The ARM64 frontend produces such chains
-    // because its IR mixes forms: 443 emissions go through
-    // MachineIRBuilder::GenMachineInsn, which inserts copies of its own, while
-    // ~2900 write their register in place, and the frontend copies guest values
-    // itself before mutating them. Upstream's frontend emits one uniform SSA
-    // form and never builds a chain.
+    // Skipped for the ARM64 guest. This frontend's IR mixes forms: some
+    // emissions go through the builder, which inserts copies of its own, while
+    // most write their register in place and the frontend copies the guest
+    // value itself before mutating it. Renaming over that IR breaks two
+    // independent invariants of the pass, each an abort rather than bad code:
     //
-    //   rename_copy_uses.cc:168: CHECK failed:
+    //   rename_copy_uses.cc: CHECK failed:
     //       rename_copy_uses_map->Get(mapped).IsInvalidReg()
+    //   lifetime.h: CHECK failed: <reg> != <reg>
     //
-    // reached from HeavyOptimizeRegion on a hot VLC H.264 decode loop.
-    //
-    // This costs an optimization, not correctness: without the pass the copies
-    // it would have renamed away simply stay, so the code is bigger and a little
-    // slower. Making the frontend emit one form would let the pass run again and
-    // is the real fix; it is a codegen change for the benchmark gate to drive.
+    // Upstream's frontend emits one uniform SSA form and hits neither. The
+    // cost here is an optimization, not correctness: the copies the pass would
+    // have renamed away simply stay, so the code is bigger and a little
+    // slower. Making the frontend emit one form is the real fix and is a
+    // codegen change for the benchmark gate to drive.
 #if !defined(BERBERIS_GUEST_FRONTEND_EMITS_NON_SSA)
     // endregion
     RenameCopyUses(machine_ir);
