@@ -564,7 +564,21 @@ void GuestThread::ProcessPendingSignalsImpl() {
     // branch this one replaces, so convert here -- once, ahead of both paths,
     // because the SIGSYS arm rewrites si_syscall and is not idempotent.
     ConvertHostSiginfoToGuest(signal_info, state_);
-    if (sa) {
+    if (sa && sa->guest_sa_sigaction == kFatalGuestHandlerStub) {
+      // InitGuestSignalHandling claims SIGSEGV/SIGILL/SIGBUS/SIGFPE with this
+      // stub so that HandleHostSignal runs first and restores a consistent
+      // guest CPU state before the crash is reported. The stub is the address
+      // of a host variable, not guest code, so it must never reach
+      // ProcessGuestSignal: the guest would branch into libberberis_arm64's
+      // data segment, trap in berberis_HandleNoExec, raise SIGSEGV again and
+      // re-enter this loop forever -- a 100% CPU spin with no crash and no
+      // progress. Beach Buggy Racing hits it the moment its GLES code calls
+      // through an unresolved function pointer and never renders a frame.
+      auto* host_ucontext = pending_signals_.GetUcontext(signal_info);
+      CHECK(host_ucontext->has_value());
+      HandleFatalSignal(signal_info->si_signo, signal_info, &host_ucontext->value());
+      pending_signals_.FreeSignal(signal_info);
+    } else if (sa) {
       ProcessGuestSignal(this, sa, signal_info);
       pending_signals_.FreeSignal(signal_info);
     } else {
