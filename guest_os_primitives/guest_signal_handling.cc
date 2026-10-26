@@ -574,6 +574,27 @@ void GuestThread::ProcessPendingSignalsImpl() {
       // re-enter this loop forever -- a 100% CPU spin with no crash and no
       // progress. Beach Buggy Racing hits it the moment its GLES code calls
       // through an unresolved function pointer and never renders a frame.
+      // These four signals used to reach the guest-state dump in the
+      // null-action arm below; now that they are dispatched here, the dump
+      // belongs here too, or a fatal guest fault loses the only record of the
+      // guest registers that produced it.
+      {
+        auto& cpu = GetCPUState(*state_);
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "Guest signal %d (fault_addr=%p, pc=%p) has no guest handler",
+            signal_info->si_signo, signal_info->si_addr,
+            ToHostAddr<void>(GetInsnAddr(cpu)));
+        for (int i = 0; i < 31; i += 4) {
+          __android_log_print(ANDROID_LOG_ERROR, "berberis",
+              "  x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx x%-2d=%016llx",
+              i, (unsigned long long)cpu.x[i],
+              i + 1, (unsigned long long)(i + 1 < 31 ? cpu.x[i + 1] : 0),
+              i + 2, (unsigned long long)(i + 2 < 31 ? cpu.x[i + 2] : 0),
+              i + 3, (unsigned long long)(i + 3 < 31 ? cpu.x[i + 3] : 0));
+        }
+        __android_log_print(ANDROID_LOG_ERROR, "berberis",
+            "  SP=%016llx", (unsigned long long)cpu.sp);
+      }
       auto* host_ucontext = pending_signals_.GetUcontext(signal_info);
       CHECK(host_ucontext->has_value());
       HandleFatalSignal(signal_info->si_signo, signal_info, &host_ucontext->value());
