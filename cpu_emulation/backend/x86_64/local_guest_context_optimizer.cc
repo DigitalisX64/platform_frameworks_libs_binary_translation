@@ -192,13 +192,16 @@ void LocalGuestContextOptimizer::InitMemRegMapFromPreds(MachineBasicBlock* bb) {
     auto* pred_bb = bb->in_edges().front()->src();
     for (const auto& m : global_mappings_.at(pred_bb->id())) {
       if (std::holds_alternative<uint64_t>(m.value)) {
-        mem_reg_map.at(m.disp) =
-            MappedRegUsage{.value = std::get<uint64_t>(m.value), .last_store = std::nullopt};
+        mem_reg_map.at(m.disp) = MappedRegUsage{.value = std::get<uint64_t>(m.value),
+                                                .last_store = std::nullopt,
+                                                .access = m.access};
       } else if (std::holds_alternative<MachineReg>(m.value)) {
         // We convert it to a predecessor reg here so we know that we need to
         // add it to live_in/out later if we use it.
-        mem_reg_map.at(m.disp) = MappedRegUsage{
-            .value = PredecessorReg{std::get<MachineReg>(m.value)}, .last_store = std::nullopt};
+        mem_reg_map.at(m.disp) =
+            MappedRegUsage{.value = PredecessorReg{std::get<MachineReg>(m.value)},
+                           .last_store = std::nullopt,
+                           .access = m.access};
       }
       // else ignore PredecessorRegs.
     }
@@ -331,13 +334,14 @@ void LocalGuestContextOptimizer::PrepareGlobalMappingsForSuccessors(
     }
     ArenaVector<DispRegMapping>& global_mappings = global_mappings_.at(bb->id());
     MappedValue mapped_val = mem_reg_map.at(offset).value().value;
+    ContextAccess mapped_access = mem_reg_map.at(offset).value().access;
     // For constants we can always reuse them.
     if (std::holds_alternative<uint64_t>(mapped_val)) {
-      global_mappings.push_back(
-          DispRegMapping{.disp = offset, .value = std::get<uint64_t>(mapped_val)});
+      global_mappings.push_back(DispRegMapping{
+          .disp = offset, .value = std::get<uint64_t>(mapped_val), .access = mapped_access});
     } else if (std::holds_alternative<MachineReg>(mapped_val)) {
-      global_mappings.push_back(
-          DispRegMapping{.disp = offset, .value = std::get<MachineReg>(mapped_val)});
+      global_mappings.push_back(DispRegMapping{
+          .disp = offset, .value = std::get<MachineReg>(mapped_val), .access = mapped_access});
       MachineReg reg = std::get<MachineReg>(mapped_val);
       // Note we do not push them to live_out until they're actually used.
       // Although we try our best to emulate the register lifetimes, it's not

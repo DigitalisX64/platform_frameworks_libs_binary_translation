@@ -94,6 +94,12 @@ class LocalGuestContextOptimizer {
   struct DispRegMapping {
     uint32_t disp;
     std::variant<MachineReg, uint64_t> value;
+    // region digitalis
+    // Carried across blocks so a mapping inherited from a predecessor keeps the
+    // width it was recorded at; a zero-width mapping would never satisfy the
+    // size check in ReplaceGetAndUpdateMap and would defeat global forwarding.
+    ContextAccess access;
+    // endregion
   };
 
   bool EligibleForGlobalOpt(const MachineBasicBlockList& nonloop_nodes, MachineBasicBlock* bb);
