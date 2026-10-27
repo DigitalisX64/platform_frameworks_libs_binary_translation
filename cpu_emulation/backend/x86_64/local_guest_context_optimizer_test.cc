@@ -909,8 +909,17 @@ TEST(MachineIRRecoverySplitGetForwarding, UnmodeledWriteRedefinitionAndCallInval
     builder.Gen<Jump>(kNullGuestAddr);
 
     x86_64::ForwardGuestContextGetsAcrossRecoverySplits(&machine_ir);
-    EXPECT_EQ((*std::next(next->insn_list().begin()))->opcode(), kMachineOpMovqRegMemBaseDisp)
-        << "variant " << variant;
+    // The get is not forwarded, so the load is still there. Its position is not
+    // fixed: a call expands to its argument setup followed by the call itself,
+    // and that setup is a copy, which is why this looks for the load rather
+    // than asserting on a slot or on the absence of copies.
+    bool get_survived = false;
+    for (auto* insn : next->insn_list()) {
+      if (insn->opcode() == kMachineOpMovqRegMemBaseDisp) {
+        get_survived = true;
+      }
+    }
+    EXPECT_TRUE(get_survived) << "variant " << variant;
   }
 }
 
