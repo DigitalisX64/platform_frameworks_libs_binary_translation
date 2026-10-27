@@ -1274,57 +1274,6 @@ TEST(MachineIRLoopGuestContextOptimizer, RemoveGetsInIrreducibleLoop) {
 
   builder.StartBasicBlock(afterloop);
   builder.Gen<Jump>(kNullGuestAddr);
-// region digitalis
-TEST(MachineIRLoopGuestContextOptimizer, SiblingInnerloopsAreOptimizedSeparately) {
-  Arena arena;
-  MachineIR machine_ir(&arena);
-
-  // preloop -> head -> inner1 (self loop) -> middle -> inner2 (self loop) -> latch,
-  // latch -> head (outer back edge) or -> afterloop.
-  auto* preloop = machine_ir.NewBasicBlock();
-  auto* head = machine_ir.NewBasicBlock();
-  auto* inner1 = machine_ir.NewBasicBlock();
-  auto* middle = machine_ir.NewBasicBlock();
-  auto* inner2 = machine_ir.NewBasicBlock();
-  auto* latch = machine_ir.NewBasicBlock();
-  auto* afterloop = machine_ir.NewBasicBlock();
-  machine_ir.AddEdge(preloop, head);
-  machine_ir.AddEdge(head, inner1);
-  machine_ir.AddEdge(inner1, inner1);
-  machine_ir.AddEdge(inner1, middle);
-  machine_ir.AddEdge(middle, inner2);
-  machine_ir.AddEdge(inner2, inner2);
-  machine_ir.AddEdge(inner2, latch);
-  machine_ir.AddEdge(latch, head);
-  machine_ir.AddEdge(latch, afterloop);
-
-  MachineReg vreg1 = machine_ir.AllocVReg();
-  MachineReg vreg2 = machine_ir.AllocVReg();
-
-  MachineIRBuilder builder(&machine_ir);
-
-  builder.StartBasicBlock(preloop);
-  builder.Gen<Branch>(head);
-
-  builder.StartBasicBlock(head);
-  builder.Gen<Branch>(inner1);
-
-  builder.StartBasicBlock(inner1);
-  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
-  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner1, middle, kMachineRegFLAGS);
-
-  builder.StartBasicBlock(middle);
-  builder.Gen<Branch>(inner2);
-
-  builder.StartBasicBlock(inner2);
-  builder.GenPut(GetThreadStateRegOffset(1), vreg2);
-  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner2, latch, kMachineRegFLAGS);
-
-  builder.StartBasicBlock(latch);
-  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
-
-  builder.StartBasicBlock(afterloop);
-  builder.Gen<Jump>(kNullGuestAddr);
 
   RemoveLoopGuestContextAccesses(&machine_ir);
   ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
@@ -1444,6 +1393,61 @@ TEST(MachineIRLoopGuestContextOptimizer, RemovePutsInIrreducibleLoop) {
                mapped_reg2,
                GetThreadStateRegOffset(1));
 }
+
+// region digitalis
+TEST(MachineIRLoopGuestContextOptimizer, SiblingInnerloopsAreOptimizedSeparately) {
+  Arena arena;
+  MachineIR machine_ir(&arena);
+
+  // preloop -> head -> inner1 (self loop) -> middle -> inner2 (self loop) -> latch,
+  // latch -> head (outer back edge) or -> afterloop.
+  auto* preloop = machine_ir.NewBasicBlock();
+  auto* head = machine_ir.NewBasicBlock();
+  auto* inner1 = machine_ir.NewBasicBlock();
+  auto* middle = machine_ir.NewBasicBlock();
+  auto* inner2 = machine_ir.NewBasicBlock();
+  auto* latch = machine_ir.NewBasicBlock();
+  auto* afterloop = machine_ir.NewBasicBlock();
+  machine_ir.AddEdge(preloop, head);
+  machine_ir.AddEdge(head, inner1);
+  machine_ir.AddEdge(inner1, inner1);
+  machine_ir.AddEdge(inner1, middle);
+  machine_ir.AddEdge(middle, inner2);
+  machine_ir.AddEdge(inner2, inner2);
+  machine_ir.AddEdge(inner2, latch);
+  machine_ir.AddEdge(latch, head);
+  machine_ir.AddEdge(latch, afterloop);
+
+  MachineReg vreg1 = machine_ir.AllocVReg();
+  MachineReg vreg2 = machine_ir.AllocVReg();
+
+  MachineIRBuilder builder(&machine_ir);
+
+  builder.StartBasicBlock(preloop);
+  builder.Gen<Branch>(head);
+
+  builder.StartBasicBlock(head);
+  builder.Gen<Branch>(inner1);
+
+  builder.StartBasicBlock(inner1);
+  builder.GenPut(GetThreadStateRegOffset(0), vreg1);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner1, middle, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(middle);
+  builder.Gen<Branch>(inner2);
+
+  builder.StartBasicBlock(inner2);
+  builder.GenPut(GetThreadStateRegOffset(1), vreg2);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, inner2, latch, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(latch);
+  builder.Gen<CondBranch>(CodeEmitter::Condition::kZero, head, afterloop, kMachineRegFLAGS);
+
+  builder.StartBasicBlock(afterloop);
+  builder.Gen<Jump>(kNullGuestAddr);
+
+  RemoveLoopGuestContextAccesses(&machine_ir);
+  ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
   // Nothing is mapped across the outer loop.
   EXPECT_EQ(preloop->insn_list().size(), 1UL);

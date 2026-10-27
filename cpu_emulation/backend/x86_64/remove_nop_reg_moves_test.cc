@@ -26,8 +26,8 @@ TEST(MachineIRRemoveNopRegMovesTest, RemovesHostRegisterMovedToItself) {
 
   builder.StartBasicBlock(bb);
   builder.Gen<MovdqaXRegXReg>(kMachineRegXMM3, kMachineRegXMM3);
-  builder.Gen<MovsdXRegXReg>(kMachineRegXMM4, kMachineRegXMM4);
-  builder.Gen<MovssXRegXReg>(kMachineRegXMM5, kMachineRegXMM5);
+  builder.Gen<MovsdXRegXReg, kNoSSA>(kMachineRegXMM4, kMachineRegXMM4);
+  builder.Gen<MovssXRegXReg, kNoSSA>(kMachineRegXMM5, kMachineRegXMM5);
   builder.Gen<MovqRegReg>(kMachineRegRBX, kMachineRegRBX);
   builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);

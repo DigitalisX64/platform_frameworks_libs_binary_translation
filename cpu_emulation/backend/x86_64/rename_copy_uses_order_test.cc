@@ -13,6 +13,7 @@
 #include "berberis/backend/x86_64/machine_ir_opt.h"
 #include "berberis/backend/x86_64/rename_copy_uses.h"
 #include "berberis/base/arena_alloc.h"
+#include "berberis/base/checks.h"
 #include "berberis/guest_state/guest_addr.h"
 
 namespace berberis::x86_64 {
@@ -23,24 +24,30 @@ namespace {
 // intrinsic whose scratch output is written early.
 class EarlyClobberTestInsn : public MachineInsnX86_64 {
  public:
-  EarlyClobberTestInsn(MachineReg use, MachineReg clobber) : MachineInsnX86_64(&kInfo) {
+  EarlyClobberTestInsn(MachineReg use, MachineReg clobber) : MachineInsnX86_64(&kInfo, regs_) {
     SetRegAt(0, use);
     SetRegAt(1, clobber);
   }
-  EarlyClobberTestInsn(const EarlyClobberTestInsn& other) : MachineInsnX86_64(other) {}
+  EarlyClobberTestInsn(const EarlyClobberTestInsn& other) : MachineInsnX86_64(other, regs_) {}
 
   std::string GetDebugString() const override { return "EARLY_CLOBBER_TEST"; }
   void Emit(CodeEmitter*) const override {}
   MachineInsn* Clone(Arena* arena) const override {
     return NewInArena<EarlyClobberTestInsn>(arena, *this);
   }
+  MachineInsnList Lower(Arena* arena) const override {
+    FATAL("Should not be called");
+    return MachineInsnList(arena);
+  }
 
  private:
-  static constexpr MachineInsnInfo kInfo = MachineInsnInfo(
-      {kMachineOpAddqRegReg,
-       2,
-       {{&kGeneralReg64, MachineRegKind::kUse}, {&kGeneralReg64, MachineRegKind::kDefEarlyClobber}},
-       kMachineInsnDefault});
+  MachineReg regs_[2];
+  static constexpr MachineInsnInfo<2> kInfo = {
+      kMachineOpAddqRegReg,
+      2,
+      {MachineRegKind{&kGeneralReg64, MachineRegKind::kUse},
+       MachineRegKind{&kGeneralReg64, MachineRegKind::kDefEarlyClobber}},
+      kMachineInsnDefault};
 };
 
 int CountCopies(MachineBasicBlock* bb) {
@@ -68,7 +75,7 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseOfRegisterTheSameInsnRedefines) {
   builder.Gen<Copy>(copy, src, kMeta<&kXmmReg>);
   // pmovsxbw copy, copy: widens in place, as the frontend's narrow-to-wide lowerings do.
   auto* widen = builder.Gen<PmovsxbwXRegXReg>(copy, copy);
-  builder.Gen<PmullwXRegXReg>(copy, src);
+  builder.Gen<PmullwXRegXReg, kNoSSA>(copy, src);
   builder.Gen<MovdqaXRegXReg>(out, copy);
   builder.Gen<Jump>(kNullGuestAddr);
   ASSERT_EQ(CheckMachineIR(machine_ir), kMachineIRCheckSuccess);
@@ -94,9 +101,9 @@ TEST(MachineIRRenameCopyUsesOrderTest, UseNotRenamedToRegisterTheSameInsnRedefin
 
   builder.StartBasicBlock(bb);
   builder.Gen<Copy>(copy, src, kMeta<&kGeneralReg64>);
-  builder.Gen<SubqRegImm>(src, 1, kMachineRegFLAGS);
+  builder.Gen<SubqRegImm, kNoSSA>(src, 1, kMachineRegFLAGS);
   // The copy's source changed after the copy: the old value lives only in `copy`.
-  auto* add = builder.Gen<AddqRegReg>(sum, copy, kMachineRegFLAGS);
+  auto* add = builder.Gen<AddqRegReg, kNoSSA>(sum, copy, kMachineRegFLAGS);
   builder.Gen<Jump>(kNullGuestAddr);
 
   RenameCopyUses(&machine_ir);

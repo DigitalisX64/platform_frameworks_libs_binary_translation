@@ -618,6 +618,30 @@ TEST(MachineIRLocalGuestContextOptimizer, UnmapWhenOverused) {
 
 
 // region digitalis
+// A block ended by a faulting guest load: bb -> {next, recovery}, the shape
+// the heavy frontends' GenRecoveryBlockForLastInsn builds.
+MachineBasicBlock* GenGuestLoadSplit(x86_64::MachineIR* machine_ir,
+                                             x86_64::MachineIRBuilder* builder) {
+  auto* bb = builder->bb();
+  auto* next = machine_ir->NewBasicBlock();
+  auto* recovery = machine_ir->NewBasicBlock();
+  machine_ir->AddEdge(bb, next);
+  machine_ir->AddEdge(bb, recovery);
+  builder->Gen<x86_64::MovqRegOp>(machine_ir->AllocVReg(), {.base = machine_ir->AllocVReg()});
+  builder->SetRecoveryPointAtLastInsn(recovery);
+  builder->Gen<Branch>(next);
+  builder->StartBasicBlock(recovery);
+  builder->Gen<Jump>(kNullGuestAddr);
+  builder->StartBasicBlock(next);
+  return next;
+}
+
+// An 8-byte FP or SIMD slot, which every guest has.
+size_t GetNarrowSimdSlotOffset() {
+  return DoesCpuStateHaveDedicatedFpRegs() ? GetThreadStateFRegOffset(0)
+                                           : GetThreadStateSimdRegOffset(0);
+}
+
 // A 64-bit MOVSD load of a guest SIMD register zeroes the upper half of its
 // XMM, so it does not hold the bits a later 128-bit read of the same register
 // needs. Forwarding it would silently replace that register's upper half with
@@ -875,9 +899,11 @@ TEST(MachineIRRecoverySplitGetForwarding, UnmodeledWriteRedefinitionAndCallInval
            .disp = static_cast<int32_t>(GetThreadStateRegOffset(0) + 4)},
           machine_ir.AllocVReg());
     } else if (variant == 1) {
-      builder.Gen<x86_64::AddqRegImm>(value, 1, x86_64::kMachineRegFLAGS);
+      builder.Gen<x86_64::AddqRegImm, x86_64::kNoSSA>(value, 1, x86_64::kMachineRegFLAGS);
     } else {
-      builder.GenCallImm(0, machine_ir.AllocVReg());
+      builder.GenCallImm(static_cast<void (*)(uint64_t)>(nullptr),
+                         machine_ir.AllocVReg(),
+                         std::tuple{machine_ir.AllocVReg()});
     }
     builder.GenGet(machine_ir.AllocVReg(), GetThreadStateRegOffset(0));
     builder.Gen<Jump>(kNullGuestAddr);

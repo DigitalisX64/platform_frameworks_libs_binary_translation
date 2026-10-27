@@ -52,7 +52,9 @@ TEST(MachineIRLoopGuestContextOptimizerOverlap, FindUnmappableOffsets) {
   builder.GenPut(GetThreadStateRegOffset(0), gp);
   builder.Gen<Jump>(kNullGuestAddr);
 
-  Loop loop({body}, machine_ir.arena());
+  Loop loop(machine_ir.arena());
+  loop.AddToBody(body);
+  loop.AddEntryBlock(body);
   auto unmappable = FindUnmappableOffsets(&machine_ir, &loop);
   EXPECT_TRUE(unmappable.at(SimdSlotOffset(0)));
   EXPECT_TRUE(unmappable.at(SimdSlotOffset(1)));
@@ -93,7 +95,9 @@ TEST(MachineIRLoopGuestContextOptimizerOverlap, OverlappingSlotsStayInMemory) {
   builder.StartBasicBlock(afterloop);
   builder.Gen<Jump>(kNullGuestAddr);
 
-  Loop loop({body}, machine_ir.arena());
+  Loop loop(machine_ir.arena());
+  loop.AddToBody(body);
+  loop.AddEntryBlock(body);
   OptimizeLoop(&machine_ir, &loop);
   ASSERT_EQ(CheckMachineIR(machine_ir), x86_64::kMachineIRCheckSuccess);
 
