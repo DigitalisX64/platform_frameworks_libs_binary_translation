@@ -26,6 +26,13 @@
 #include <unistd.h>
 // endregion
 
+// region digitalis
+#if defined(__x86_64__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include "berberis/assembler/x86_64.h"
+#include "berberis/runtime_library/runtime_library.h"
+#endif
+// endregion
+
 #include "berberis/base/bit_util.h"
 // region digitalis
 #include "berberis/base/mmap.h"
@@ -71,6 +78,35 @@ uint8_t* AllocExecutableRegion() {
       .berberis_flags = kMmapBerberis32Bit,
   }));
 }
+
+// region digitalis
+#if defined(__x86_64__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+TEST(CodePool, AllExecutablePoolsRelocateToExitTrampoline) {
+  ASSERT_EQ(GetExecutableMmapFlags(), kMmapBerberisCode32Bit);
+  ASSERT_GE(kEntryExitGeneratedCode, uint32_t{0x80000000});
+  RecordProperty("exit_trampoline", std::to_string(kEntryExitGeneratedCode));
+  auto check = [](auto* pool) {
+    MachineCode code;
+    x86_64::Assembler as(&code);
+    as.Jmp32(kEntryExitGeneratedCode);
+    as.Jcc32(x86_64::Assembler::Condition::kEqual, kEntryExitGeneratedCode);
+    as.Finalize();
+    HostCodeAddr installed = pool->Add(&code);
+    ASSERT_GE(installed, uint32_t{0x80000000});
+    ASSERT_LT(uint64_t{installed} + code.install_size(), uint64_t{1} << 32);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(uintptr_t{installed});
+    int32_t jump, conditional;
+    memcpy(&jump, bytes + 1, sizeof(jump));
+    memcpy(&conditional, bytes + 7, sizeof(conditional));
+    EXPECT_EQ(int64_t{installed} + 5 + jump, int64_t{kEntryExitGeneratedCode});
+    EXPECT_EQ(int64_t{installed} + 11 + conditional, int64_t{kEntryExitGeneratedCode});
+  };
+  check(GetDefaultCodePoolInstance());
+  check(GetColdCodePoolInstance());
+  check(GetFunctionWrapperCodePoolInstance());
+}
+#endif
+// endregion
 
 TEST(CodePool, Smoke) {
   MockExecRegionFactory exec_region_factory_mock;

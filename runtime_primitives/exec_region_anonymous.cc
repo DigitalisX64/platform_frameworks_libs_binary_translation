@@ -18,6 +18,11 @@
 
 #include <sys/mman.h>
 
+// region digitalis
+#include <cerrno>
+#include <cstring>
+// endregion
+
 #include "berberis/base/fd.h"
 #include "berberis/base/mmap.h"
 
@@ -48,6 +53,23 @@ namespace {
 ExecRegion CreateImpl(size_t size, bool fatal) {
   size = AlignUpPageSize(size);
 
+  // region digitalis
+  // Reserve before creating a memfd, so an exhausted code window fails without
+  // file-descriptor or mapping syscalls on every subsequent translation.
+  void* reserved = nullptr;
+#if defined(__x86_64__)
+  if (GetExecutableMmapFlags() == kMmapBerberisCode32Bit) {
+    reserved =
+        MmapImpl({.size = size, .prot = PROT_NONE, .berberis_flags = kMmapBerberisCode32Bit});
+    if (reserved == MAP_FAILED) {
+      if (fatal) {
+        FATAL("Unable to reserve executable code region: %s", strerror(errno));
+      }
+      return ExecRegion{};
+    }
+  }
+#endif
+  // endregion
   auto fd = CreateMemfdOrDie("exec");
   // region digitalis - tag as host-owned so a concurrent guest fd sweep can't
   // close the fd between here and the maps below; see fd.h.
@@ -56,21 +78,25 @@ ExecRegion CreateImpl(size_t size, bool fatal) {
   FtruncateOrDie(fd, static_cast<off64_t>(size));
 
 #if defined(__x86_64__)
-  constexpr int kBerberisFlags = kMmapBerberis32Bit;
+  // region digitalis
+  const int kBerberisFlags = reserved ? 0 : kMmapBerberis32Bit;
+  // endregion
 #else
   // TODO(b/363611588): enable for other backends (arm64/riscv64)
   constexpr int kBerberisFlags = 0;
 #endif  // defined(__x86_64__)
 
   // region digitalis
+  const MmapImplArgs exec_args{.addr = reserved,
+                               .size = size,
+                               .prot = PROT_READ | PROT_EXEC,
+                               .flags = reserved ? MAP_SHARED | MAP_FIXED : MAP_SHARED,
+                               .fd = fd,
+                               .berberis_flags = kBerberisFlags};
   // Non-fatal path: map with MmapImpl and unwind on failure so the caller can
   // fall back to interpreting the region.
   if (!fatal) {
-    void* exec = MmapImpl({.size = size,
-                           .prot = PROT_READ | PROT_EXEC,
-                           .flags = MAP_SHARED,
-                           .fd = fd,
-                           .berberis_flags = kBerberisFlags});
+    void* exec = MmapImpl(exec_args);
     if (exec == MAP_FAILED) {
       CloseHostOwnedFdUnsafe(fd);
       return ExecRegion{};
@@ -88,11 +114,9 @@ ExecRegion CreateImpl(size_t size, bool fatal) {
   // endregion
 
   ExecRegion result{
-      static_cast<uint8_t*>(MmapImplOrDie({.size = size,
-                                           .prot = PROT_READ | PROT_EXEC,
-                                           .flags = MAP_SHARED,
-                                           .fd = fd,
-                                           .berberis_flags = kBerberisFlags})),
+      // region digitalis
+      static_cast<uint8_t*>(MmapImplOrDie(exec_args)),
+      // endregion
       static_cast<uint8_t*>(MmapImplOrDie(
           {.size = size, .prot = PROT_READ | PROT_WRITE, .flags = MAP_SHARED, .fd = fd})),
       size};

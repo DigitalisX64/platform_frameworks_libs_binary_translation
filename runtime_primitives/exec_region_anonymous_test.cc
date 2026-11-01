@@ -20,6 +20,10 @@
 
 #include "berberis/runtime_primitives/exec_region_anonymous.h"
 
+// region digitalis
+#include "berberis/base/mmap.h"
+// endregion
+
 namespace berberis {
 
 namespace {
@@ -30,6 +34,14 @@ TEST(ExecRegionAnonymous, Smoke) {
   ExecRegion exec = ExecRegionAnonymousFactory::Create(sizeof(buf));
   const uint8_t* code = exec.begin();
   ASSERT_NE(nullptr, code);
+  // region digitalis
+#if defined(__x86_64__)
+  if (GetExecutableMmapFlags() == kMmapBerberisCode32Bit) {
+    EXPECT_GE(reinterpret_cast<uintptr_t>(code), uintptr_t{1} << 31);
+    EXPECT_LE(reinterpret_cast<uintptr_t>(code) + exec.size(), (uintptr_t{1} << 32) - kPageSize);
+  }
+#endif
+  // endregion
 
   exec.Write(code, buf, sizeof(buf));
   ASSERT_EQ('f', code[7]);

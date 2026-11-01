@@ -16,10 +16,12 @@
 
 #include "berberis/runtime/init_guest_arch.h"
 
+#include "berberis/base/mmap.h"
+
 namespace berberis {
 
 void InitGuestArch() {
-  // Nothing special for arm64
+  EnableCodeWindow();
 }
 
 }  // namespace berberis

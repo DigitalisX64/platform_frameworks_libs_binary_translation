@@ -35,6 +35,11 @@ bool IsAddressGuestExecutable(GuestAddr pc) {
 }
 
 bool InitBerberisUnsafe() {
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  InitGuestArch();
+#endif
+  // endregion
   InitLargeMmap();
   InitHostEntries();
   Tracing::Init();
@@ -42,7 +47,13 @@ bool InitBerberisUnsafe() {
   InitGuestFunctionWrapper(&IsAddressGuestExecutable);
   InitTranslator();
   InitGuestSignalHandling();
+  // region digitalis
+#if !defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // endregion
   InitGuestArch();
+  // region digitalis
+#endif
+  // endregion
   return true;
 }
 
