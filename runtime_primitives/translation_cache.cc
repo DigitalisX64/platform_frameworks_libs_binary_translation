@@ -239,7 +239,11 @@ GuestAddr TranslationCache::SlowLookupGuestCodeEntryPCByHostPC(HostCode pc) {
   for (auto& it : guest_entries_) {
     auto* entry = &it.second;
     auto host_code = entry->host_code->load();
-    if (host_code <= pc_addr && pc_addr < host_code + entry->host_size) {
+    // region digitalis
+    // if (host_code <= pc_addr && pc_addr < host_code + entry->host_size) {
+    const uint64_t end = static_cast<uint64_t>(host_code) + entry->host_size;
+    if (host_code <= pc_addr && pc_addr < end) {
+      // endregion
       return it.first;
     }
   }

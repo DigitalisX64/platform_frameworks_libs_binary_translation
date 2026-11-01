@@ -741,3 +741,44 @@ python_binary_host {
     main: "tests/gen_gtest_failure_template.py",
     srcs: ["tests/gen_gtest_failure_template.py"],
 }
+
+// region digitalis
+// Exercise the Android ELF-backed wrapper pool through the production ARM64
+// bridge, alongside the anonymous pools and their shared address allocator.
+cc_test {
+    name: "berberis_code_window_tests",
+    defaults: ["berberis_arm64_defaults"],
+    enabled: false,
+    arch: {
+        x86_64: {
+            enabled: true,
+        },
+    },
+    srcs: [
+        "base/mmap_test.cc",
+        "runtime_primitives/code_pool_test.cc",
+        "runtime_primitives/exec_region_anonymous_test.cc",
+        "runtime_primitives/exec_region_anonymous_try_test.cc",
+        "runtime_primitives/exec_region_elf_backed_test.cc",
+        "runtime_primitives/translation_cache_test.cc",
+        "test_utils/code_window_tests_main.cc",
+        "kernel_api/arm64/code_window_protection_test.cc",
+    ],
+    header_libs: [
+        "libberberis_assembler_headers",
+        "libberberis_base_headers",
+        "libberberis_kernel_api_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_runtime_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    static_libs: ["libgmock"],
+    shared_libs: [
+        "libberberis_arm64",
+        "liblog",
+    ],
+    required: ["libberberis_exec_region"],
+    test_suites: ["general-tests"],
+}
+
+// endregion

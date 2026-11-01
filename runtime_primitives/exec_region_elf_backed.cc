@@ -43,6 +43,9 @@ ExecRegion ExecRegionElfBackedFactory::Create(size_t size) {
 
   // Since we cannot force android loader to map library in lower 2G memory we will need
   // to reserve the space first and then direct the loader to load the library at that address.
+  // region digitalis
+  // Reserve from the selected code pool before directing the Android loader to use it.
+  // endregion
   size_t load_size = TinyLoader::CalculateLoadSize(kExecRegionLibraryPath, nullptr);
   CHECK_NE(load_size, 0);
 
@@ -50,7 +53,10 @@ ExecRegion ExecRegionElfBackedFactory::Create(size_t size) {
                                    .size = load_size,
                                    .prot = PROT_NONE,
                                    .flags = MAP_ANONYMOUS | MAP_PRIVATE,
-                                   .berberis_flags = kMmapBerberis32Bit});
+                                   // region digitalis
+                                   // .berberis_flags = kMmapBerberis32Bit});
+                                   .berberis_flags = GetExecutableMmapFlags()});
+  // endregion
 
   android_dlextinfo dlextinfo{.flags = ANDROID_DLEXT_FORCE_LOAD | ANDROID_DLEXT_RESERVED_ADDRESS,
                               .reserved_addr = load_addr,

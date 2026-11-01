@@ -30,6 +30,10 @@
 #include "gtest/gtest.h"
 
 #include <sys/resource.h>
+// region digitalis
+#include <unistd.h>
+#include "berberis/base/mmap.h"
+// endregion
 
 #include <cstddef>
 
@@ -38,6 +42,38 @@
 namespace berberis {
 
 namespace {
+
+// region digitalis
+#if defined(__x86_64__)
+TEST(ExecRegionAnonymousTryCreate, ExhaustionDoesNotCreateMemfd) {
+  if (GetExecutableMmapFlags() != kMmapBerberisCode32Bit) {
+    GTEST_SKIP() << "This guest keeps the original executable-address policy";
+  }
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  auto run = [] {
+    constexpr size_t kSize = ExecRegionAnonymousFactory::kExecRegionSize;
+    while (MmapImpl({.size = kSize, .prot = PROT_NONE, .berberis_flags = kMmapBerberisCode32Bit}) !=
+           MAP_FAILED) {
+    }
+    rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+      _exit(1);
+    }
+    limit.rlim_cur = 0;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+      _exit(2);
+    }
+    for (int i = 0; i < 100; ++i) {
+      if (ExecRegionAnonymousFactory::TryCreate(kSize).begin() != nullptr) {
+        _exit(3);
+      }
+    }
+    _exit(0);
+  };
+  ASSERT_EXIT(run(), ::testing::ExitedWithCode(0), "");
+}
+#endif
+// endregion
 
 TEST(ExecRegionAnonymousTryCreate, SucceedsForNormalSize) {
   ExecRegion region = ExecRegionAnonymousFactory::TryCreate(

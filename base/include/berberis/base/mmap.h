@@ -52,9 +52,37 @@ constexpr bool IsAlignedPageSize(T x) {
   return IsAligned(x, kPageSize);
 }
 
+// region digitalis
+#if defined(MAP_FIXED_NOREPLACE)
+inline constexpr int kMmapFixedNoReplace = MAP_FIXED_NOREPLACE;
+#else
+// Compatibility with Linux headers predating MAP_FIXED_NOREPLACE.
+inline constexpr int kMmapFixedNoReplace = 0x100000;
+#endif
+// endregion
+
 enum MmapBerberisFlags {
   kMmapBerberis32Bit = 1,
+  // region digitalis
+  // On x86-64, allocate from randomized, process-lifetime code reservations in
+  // [2 GiB, 4 GiB - one page). Released slices are not reused. On x86-64, addr is ignored.
+  // On other hosts, use the existing kMmapBerberis32Bit placement instead.
+  // Zero size, fixed mappings and combining both flags return EINVAL on all hosts.
+  // Data requiring signed 32-bit absolute addresses must use kMmapBerberis32Bit.
+  kMmapBerberisCode32Bit = 2,
+  // endregion
 };
+
+// region digitalis
+// Call before creating any executable pool or starting translated guest threads.
+// This selects the code window for executable factories and completes its
+// initialization before raw-clone fork children can allocate code.
+void EnableCodeWindow();
+int GetExecutableMmapFlags();
+// Page-rounded overlap with actual code-window ownership, including unused and
+// released slices. Does not initialize the window or acquire library locks.
+bool IntersectsCodeWindow(const void* addr, size_t size);
+// endregion
 
 struct MmapImplArgs {
   void* addr = nullptr;
