@@ -35,6 +35,21 @@ using std::chrono_literals::operator""ms;
 // A test guest pc that is valid in both 32bit and 64bit modes.
 constexpr GuestAddr kGuestPC = 0x1234'5678;
 
+// region digitalis
+TEST(TranslationCacheTest, HostRangeEndingAt4GiBDoesNotWrap) {
+  TranslationCache tc;
+  constexpr HostCodeAddr kStart = 0xfffff000u;
+  GuestCodeEntry* entry = tc.AddAndLockForTranslation(kGuestPC, 0);
+  ASSERT_NE(entry, nullptr);
+  tc.SetTranslatedAndUnlock(
+      kGuestPC, entry, 4, GuestCodeEntry::Kind::kSpecialHandler, {kStart, 4096});
+  EXPECT_EQ(tc.SlowLookupGuestCodeEntryPCByHostPC(AsHostCode(kStart)), kGuestPC);
+  EXPECT_EQ(tc.SlowLookupGuestCodeEntryPCByHostPC(AsHostCode(HostCodeAddr{0xfffffff0u})), kGuestPC);
+  EXPECT_EQ(tc.SlowLookupGuestCodeEntryPCByHostPC(AsHostCode(kStart - 1)), 0u);
+  EXPECT_EQ(tc.SlowLookupGuestCodeEntryPCByHostPC(AsHostCode(HostCodeAddr{0})), 0u);
+}
+// endregion
+
 TEST(TranslationCacheTest, DefaultNotTranslated) {
   TranslationCache tc;
 
