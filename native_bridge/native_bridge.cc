@@ -33,6 +33,8 @@
 #include "procinfo/process_map.h"
 
 // region digitalis
+#include "guest_load_error.h"
+
 #include <android/log.h>
 #define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "berberis", __VA_ARGS__)
 
@@ -160,6 +162,12 @@ class BerberisNativeBridge {
   std::map<std::string, native_bridge_namespace_t> exported_namespaces_;
 };
 
+// region digitalis
+// The guest error of this thread's last failed LoadLibrary(); dlerror() is
+// per thread, so the latch is too.
+thread_local berberis::GuestLoadError g_guest_load_error;
+// endregion
+
 BerberisNativeBridge::BerberisNativeBridge() : guest_loader_(nullptr) {}
 
 BerberisNativeBridge::~BerberisNativeBridge() {}
@@ -181,6 +189,8 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
   UNUSED(init_finalized);
 
   // region digitalis
+  g_guest_load_error.Clear();
+
   // In-APK path fast path: when libpath is "<apk>!/<entry>" (Qt 6 apps that
   // ship native libs inside base.apk), the guest linker's own load of that
   // path is known to either fail fast (sister Qt 6 libs) or hang for >30 s
@@ -198,7 +208,7 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
       if (cached != nullptr) {
         return cached;
       }
-      const char* cache_err = guest_loader_->DlError();
+      const char* cache_err = g_guest_load_error.Save(guest_loader_->DlError());
       DIGITALIS_LOG("LoadGuestLibrary for extracted %s failed: %s",
                     extracted.c_str(), cache_err ? cache_err : "(no error)");
     }
@@ -213,7 +223,8 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
 
   // region digitalis
   {
-    const char* guest_err = guest_loader_->DlError();
+    // Keep the guest cause: the host fallback below replaces dlerror().
+    const char* guest_err = g_guest_load_error.Save(guest_loader_->DlError());
     DIGITALIS_LOG("LoadGuestLibrary FAILED for %s: %s", libpath, guest_err ? guest_err : "(no error)");
   }
   // endregion
@@ -235,6 +246,9 @@ void* BerberisNativeBridge::LoadLibrary(const char* libpath,
 
   handle = android_dlopen_ext(libpath, flags, extinfo);
   if (handle != nullptr) {
+    // region digitalis
+    g_guest_load_error.Clear();
+    // endregion
     TRACE_AND_ALOGI("'%s' library was loaded for the host platform.", libpath);
     AddHostLibrary(handle);
   }
@@ -274,6 +288,12 @@ GuestAddr BerberisNativeBridge::DlSym(void* handle, const char* name) {
 
 const char* BerberisNativeBridge::DlError() {
   // There is no good way of knowing where the error happened, - prioritize the guest loader.
+  // region digitalis
+  // A failed LoadLibrary() saved the guest cause before the host fallback.
+  if (const char* saved = g_guest_load_error.Take(); saved != nullptr) {
+    return saved;
+  }
+  // endregion
   const char* error = guest_loader_->DlError();
   if (error != nullptr) {
     return error;
