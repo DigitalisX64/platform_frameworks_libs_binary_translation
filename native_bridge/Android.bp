@@ -112,3 +112,12 @@ cc_library_static {
     },
 }
 // endregion
+
+// region digitalis
+// Host tests for the guest load-error latch used by native_bridge.cc.
+cc_test_host {
+    name: "berberis_native_bridge_load_error_tests",
+    defaults: ["berberis_defaults"],
+    srcs: ["guest_load_error_test.cc"],
+}
+// endregion

@@ -15,6 +15,7 @@
  */
 
 #include "native_bridge.h"
+#include "guest_load_error.h"
 
 #include <dlfcn.h>
 #include <libgen.h>
@@ -159,6 +160,12 @@ class NdktNativeBridge {
   std::map<std::string, native_bridge_namespace_t> exported_namespaces_;
 };
 
+// region digitalis
+// The guest error of this thread's last failed LoadLibrary(); dlerror() is
+// per thread, so the latch is too.
+thread_local berberis::GuestLoadError g_guest_load_error;
+// endregion
+
 NdktNativeBridge::NdktNativeBridge() : guest_loader_(nullptr) {}
 
 NdktNativeBridge::~NdktNativeBridge() {}
@@ -178,6 +185,7 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
   // routine from here, just before we load any app's native code.
   static bool init_finalized = FinalizeInit();
   UNUSED(init_finalized);
+  g_guest_load_error.Clear();
 
   // region digitalis
   // In-APK path fast path: when libpath is "<apk>!/<entry>" (Qt 6 apps that
@@ -197,7 +205,7 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
       if (cached != nullptr) {
         return cached;
       }
-      const char* cache_err = guest_loader_->DlError();
+      const char* cache_err = g_guest_load_error.Save(guest_loader_->DlError());
       DIGITALIS_LOG("LoadGuestLibrary for extracted %s failed: %s",
                     extracted.c_str(), cache_err ? cache_err : "(no error)");
     }
@@ -212,7 +220,8 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
 
   // region digitalis
   {
-    const char* guest_err = guest_loader_->DlError();
+    // Keep the guest cause: the host fallback below replaces dlerror().
+    const char* guest_err = g_guest_load_error.Save(guest_loader_->DlError());
     DIGITALIS_LOG("LoadGuestLibrary FAILED for %s: %s", libpath, guest_err ? guest_err : "(no error)");
   }
   // endregion
@@ -234,6 +243,7 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
 
   handle = android_dlopen_ext(libpath, flags, extinfo);
   if (handle != nullptr) {
+    g_guest_load_error.Clear();
     TRACE_AND_ALOGI("'%s' library was loaded for the host platform.", libpath);
     AddHostLibrary(handle);
   }
@@ -273,6 +283,12 @@ GuestAddr NdktNativeBridge::DlSym(void* handle, const char* name) {
 
 const char* NdktNativeBridge::DlError() {
   // There is no good way of knowing where the error happened, - prioritize the guest loader.
+  // region digitalis
+  // A failed LoadLibrary() saved the guest cause before the host fallback.
+  if (const char* saved = g_guest_load_error.Take(); saved != nullptr) {
+    return saved;
+  }
+  // endregion
   const char* error = guest_loader_->DlError();
   if (error != nullptr) {
     return error;
