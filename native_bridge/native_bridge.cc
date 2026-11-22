@@ -15,7 +15,6 @@
  */
 
 #include "native_bridge.h"
-#include "guest_load_error.h"
 
 #include <dlfcn.h>
 #include <libgen.h>
@@ -32,6 +31,8 @@
 #include "procinfo/process_map.h"
 
 // region digitalis
+#include "guest_load_error.h"
+
 #include <android/log.h>
 #define DIGITALIS_LOG(...) __android_log_print(ANDROID_LOG_DEBUG, "berberis", __VA_ARGS__)
 
@@ -185,9 +186,10 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
   // routine from here, just before we load any app's native code.
   static bool init_finalized = FinalizeInit();
   UNUSED(init_finalized);
-  g_guest_load_error.Clear();
 
   // region digitalis
+  g_guest_load_error.Clear();
+
   // In-APK path fast path: when libpath is "<apk>!/<entry>" (Qt 6 apps that
   // ship native libs inside base.apk), the guest linker's own load of that
   // path is known to either fail fast (sister Qt 6 libs) or hang for >30 s
@@ -243,7 +245,9 @@ void* NdktNativeBridge::LoadLibrary(const char* libpath,
 
   handle = android_dlopen_ext(libpath, flags, extinfo);
   if (handle != nullptr) {
+    // region digitalis
     g_guest_load_error.Clear();
+    // endregion
     TRACE_AND_ALOGI("'%s' library was loaded for the host platform.", libpath);
     AddHostLibrary(handle);
   }
